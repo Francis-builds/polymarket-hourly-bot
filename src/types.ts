@@ -24,12 +24,25 @@ export interface Orderbook {
     bids: OrderbookLevel[];
     asks: OrderbookLevel[];
   };
+  // Window info for multi-period monitoring
+  windowOffset?: number;  // 0 = current, 1 = next, 2 = +2
+  windowLabel?: string;   // "now", "+1", "+2"
+}
+
+// Market window info (current, +1, +2 periods ahead)
+export interface MarketWindow {
+  offset: number;       // 0 = current, 1 = next, 2 = +2
+  label: string;        // "now", "+1", "+2"
+  startTime: Date;      // When this market window starts
+  endTime: Date;        // When this market window ends
 }
 
 // Dip detection
 export interface DipOpportunity {
   market: string;
   timestamp: number;
+  // Market window info
+  marketWindow?: MarketWindow;
   // Best ask prices (top of book)
   askUp: number;
   askDown: number;

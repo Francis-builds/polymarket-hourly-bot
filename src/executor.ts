@@ -66,14 +66,24 @@ export async function initExecutor(): Promise<void> {
       passphrase: config.clobApi.passphrase,
     };
 
-    // ClobClient constructor: (host, chainId, signer, creds, signatureType)
-    // signatureType: 0 = EOA, 1 = POLY_GNOSIS_SAFE, 2 = POLY_PROXY
+    // ClobClient constructor: (host, chainId, signer, creds, signatureType, funder)
+    // signatureType: 2 = GNOSIS_SAFE (for accounts created via MetaMask browser wallet)
+    // funder: proxy wallet address where funds are held (visible in Polymarket profile)
+    const funderAddress = config.proxyWalletAddress;
+
+    if (!funderAddress) {
+      throw new Error('Missing POLYMARKET_PROXY_ADDRESS. Set it to your proxy wallet address from Polymarket profile.');
+    }
+
+    log.info({ funderAddress }, 'Using proxy wallet as funder');
+
     clobClient = new ClobClient(
       CLOB_HOST,
       config.chainId,
       signer,
       apiCreds,
-      0 // EOA signature type
+      2, // GNOSIS_SAFE signature type (MetaMask browser wallet)
+      funderAddress // Proxy wallet address
     );
 
     log.info('✅ Polymarket CLOB client initialized - REAL TRADING ENABLED');
@@ -301,12 +311,14 @@ async function executeOrder(
       orderType === 'FOK' ? OrderType.FOK : OrderType.GTC
     );
 
-    // Check for errors
-    if (result.errorMsg) {
-      log.warn({ result }, 'CLOB order returned error');
+    // Check for errors - both errorMsg and HTTP error status codes
+    const httpStatus = (result as { status?: number }).status;
+    if (result.errorMsg || (httpStatus && httpStatus >= 400)) {
+      const errorMessage = result.errorMsg || `HTTP ${httpStatus}`;
+      log.error({ result, httpStatus }, `❌ CLOB order FAILED: ${errorMessage}`);
       return {
         success: false,
-        error: result.errorMsg,
+        error: errorMessage,
       };
     }
 

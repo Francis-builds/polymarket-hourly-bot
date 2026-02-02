@@ -1,212 +1,195 @@
-# Polymarket Dip Arbitrage Bot
+# Polymarket Hourly Bot (1h)
 
-Automated dip arbitrage bot for Polymarket's 15-minute crypto UP/DOWN markets.
+Bot de arbitraje que detecta y ejecuta trades en mercados de 1 hora de Polymarket.
 
-## Strategy
+## Status
 
-**Core Concept:** When `UP_ask + DOWN_ask < $0.92`, buy both sides. One side always pays $1.00 at resolution, guaranteeing profit after fees.
+- **Operativo**: ✅ Sí
+- **Servidor**: AWS eu-west-1 (54.229.162.200)
+- **Container**: `polymarket-hourly-bot`
+- **Telegram Bot**: Token separado del bot de 15m
 
-**Example:**
-- Buy UP @ $0.45, DOWN @ $0.45 = $0.90 total
-- One side pays $1.00
-- Profit: $1.00 - $0.90 - 3% fees = ~$0.07 (7.7% ROI)
+## Qué hace
 
-## Features
+Monitorea los mercados UP/DOWN de 1 hora (BTC, ETH, SOL, XRP) buscando "dips" - situaciones donde el costo total de comprar UP + DOWN es menor a $1.00. Como uno de los dos siempre resuelve a $1.00, esto genera ganancia garantizada.
 
-- **Real-time orderbook monitoring** via Polymarket WebSocket
-- **Slippage-aware execution** with VWAP calculations
-- **Liquidity analysis** before trade execution
-- **Dip duration tracking** for strategy optimization
-- **Paper trading mode** for testing
-- **Telegram notifications** for all events
-- **SQLite persistence** for positions and stats
+### Ejemplo
+```
+UP ask:  $0.55
+DOWN ask: $0.42
+Total:   $0.97 (3% de descuento)
 
-## Markets Monitored
+Al resolver, uno paga $1.00 → Ganancia: $0.03 por share
+```
 
-| Symbol | Market |
-|--------|--------|
-| BTC | Bitcoin Up or Down (15-min) |
-| ETH | Ethereum Up or Down (15-min) |
-| SOL | Solana Up or Down (15-min) |
-| XRP | XRP Up or Down (15-min) |
+## Fees (1h markets)
 
-## Quick Start
+**Los mercados de 1h son FREE (0% fees).**
 
-### 1. Prerequisites
+Esto hace que cualquier dip sea más rentable comparado con los mercados de 15m.
 
-- Node.js 22+
-- Docker (for deployment)
-- Polymarket wallet with USDC on Polygon
-- Telegram bot token (from @BotFather)
+## Configuración
 
-### 2. Local Development
+### Variables de entorno (.env)
 
 ```bash
-# Clone repo
-git clone https://github.com/Francis-builds/polymarket-dip-bot.git
-cd polymarket-dip-bot
+# Trading mode
+PAPER_TRADING=false
+SIMULATE_DIPS=false
+MARKET_TIMEFRAME=1h
 
-# Install dependencies
-npm install
+# Polymarket Wallet
+POLYMARKET_PRIVATE_KEY=0x...
+POLYMARKET_ADDRESS=0x...
+POLYMARKET_PROXY_ADDRESS=0x...
 
-# Copy environment template
-cp .env.example .env
-# Edit .env with your values
+# CLOB API
+POLYMARKET_API_KEY=...
+POLYMARKET_API_SECRET=...
+POLYMARKET_API_PASSPHRASE=...
 
-# Run in development (paper trading)
-npm run dev
+# Telegram (DIFERENTE del bot de 15m)
+TELEGRAM_BOT_TOKEN=8596245409:AAG...
+TELEGRAM_CHAT_ID=1648556893
+
+# RPC
+POLYGON_RPC_URL=https://polygon-rpc.com
+
+# Trading params
+THRESHOLD=0.97
+MAX_POSITION_SIZE=100
+MAX_OPEN_POSITIONS=3
 ```
 
-### 3. Deploy to GCP
+### Parámetros clave
 
-```bash
-# Create VM (once)
-gcloud compute instances create polymarket-bot \
-  --zone=us-east1-b \
-  --machine-type=e2-small \
-  --image-family=ubuntu-2204-lts \
-  --image-project=ubuntu-os-cloud \
-  --boot-disk-size=20GB
+| Variable | Descripción |
+|----------|-------------|
+| `MARKET_TIMEFRAME` | Debe ser `1h` |
+| `THRESHOLD` | Costo máximo para ejecutar (0.97 = 3% descuento mínimo) |
+| `MAX_POSITION_SIZE` | Máximo USDC **total** por trade (UP + DOWN combinados) |
 
-# SSH into VM
-gcloud compute ssh fran@polymarket-bot --zone=us-east1-b
+## Diferencias con el bot de 15m
 
-# Install Docker
-curl -fsSL https://get.docker.com | sh
-sudo usermod -aG docker $USER
-# Log out and back in
+| Aspecto | 15m Bot | 1h Bot |
+|---------|---------|--------|
+| Fees | ~1-1.5% (variable) | **0% (gratis)** |
+| Slug format | `btc-updown-15m-{ts}` | `bitcoin-up-or-down-february-2-12pm-et` |
+| Rotación | Cada 15 min | Cada hora |
+| Timezone | UTC timestamp | Eastern Time (ET) |
 
-# Clone and deploy
-git clone https://github.com/Francis-builds/polymarket-dip-bot.git
-cd polymarket-dip-bot
-
-# Create .env with your credentials
-nano .env
-
-# Start bot (only polymarket-bot service)
-docker compose up -d polymarket-bot
-
-# View logs
-docker logs polymarket-dip-bot -f
-```
-
-## Configuration
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `PAPER_TRADING` | Enable paper trading mode | `true` |
-| `POLYMARKET_PRIVATE_KEY` | Wallet private key | Required for live |
-| `POLYMARKET_ADDRESS` | Wallet address | Required for live |
-| `POLYMARKET_API_KEY` | CLOB API key | Required for live |
-| `POLYMARKET_API_SECRET` | CLOB API secret | Required for live |
-| `POLYMARKET_PASSPHRASE` | CLOB passphrase | Required for live |
-| `TELEGRAM_BOT_TOKEN` | Telegram bot token | Required |
-| `TELEGRAM_CHAT_ID` | Your Telegram chat ID | Required |
-| `DIP_THRESHOLD` | Buy when total < this | `0.92` |
-| `MAX_POSITION_SIZE` | Max USD per trade | `50` |
-| `MAX_OPEN_POSITIONS` | Max simultaneous trades | `2` |
-| `FEE_RATE` | Polymarket fee rate | `0.03` |
-| `MAX_SLIPPAGE_PCT` | Max allowed slippage | `0.02` |
-
-## How It Works
-
-### Dip Detection
-
-1. Subscribe to Polymarket WebSocket for orderbook updates
-2. Calculate best-case cost: `askUp + askDown`
-3. If cost < threshold (0.92), analyze liquidity
-4. Calculate VWAP for target position size
-5. Check slippage within limits
-6. Execute if profitable after fees
-
-### Dip Duration Tracking
-
-The bot tracks how long each dip opportunity lasts:
-
-```
-🔔 DIP STARTED - $100 FOK analysis
-   cost=0.89, profitPct=12.3%, liqUp=450, liqDown=380, canFill100=YES
-
-⏱️ DIP ENDED - Duration tracking
-   durationSec=47.2, minCost=0.87, maxLiqUp=520, maxLiqDown=410
-```
-
-This data helps understand:
-- How fast we need to execute
-- Whether $100 FOK orders can fill
-- Optimal position sizing
-
-### Position Resolution
-
-Markets resolve every 15 minutes. The bot:
-1. Checks resolution status via Polymarket API
-2. Records outcome (UP or DOWN won)
-3. Calculates actual profit/loss
-4. Updates statistics
-
-## Telegram Notifications
-
-| Event | Emoji |
-|-------|-------|
-| Bot started | 🤖 |
-| Dip detected | 🎯 |
-| Trade executed | ✅ |
-| Trade failed | ❌ |
-| Position resolved | 💰 |
-| Dip started (tracking) | 🔔 |
-| Dip ended (tracking) | ⏱️ |
-
-## Monitoring
-
-```bash
-# View live logs
-docker logs polymarket-dip-bot -f
-
-# Check container status
-docker ps
-
-# Restart bot
-docker compose restart polymarket-bot
-
-# Stop bot
-docker compose down
-```
-
-## Architecture
+## Arquitectura
 
 ```
 src/
-├── main.ts           # Entry point
-├── config.ts         # Environment configuration
-├── market-data.ts    # WebSocket orderbook streaming
-├── dip-detector.ts   # Dip detection + duration tracking
-├── executor.ts       # Trade execution (paper/live)
-├── position-manager.ts # Position tracking
-├── resolution-tracker.ts # Market resolution
-├── liquidity-analyzer.ts # VWAP + slippage analysis
-├── notifier.ts       # Telegram notifications
-├── db.ts             # SQLite persistence
-└── types.ts          # TypeScript types
+├── index.ts              # Entry point
+├── config.ts             # Configuración desde env vars
+├── market-data.ts        # WebSocket + cálculo de hora ET
+├── dip-detector.ts       # Detección de dips
+├── executor.ts           # Ejecución de órdenes via CLOB API
+├── position-manager.ts   # Tracking de posiciones abiertas
+├── resolution-tracker.ts # Monitoreo de resolución de mercados
+├── notifier.ts           # Telegram notificaciones + comandos
+├── db.ts                 # SQLite para persistencia
+└── logger.ts             # Logging con pino
 ```
 
-## Costs
+## Comandos Telegram
 
-| Item | Monthly |
-|------|---------|
-| GCP VM (e2-small) | ~$15 |
-| Disk (20GB) | ~$2 |
-| Network | ~$1 |
-| **Total** | **~$18/month** |
+| Comando | Descripción |
+|---------|-------------|
+| `/status` | Estado actual del bot |
+| `/wallet` | Balance del wallet |
+| `/portfolio` | Portfolio completo de Polymarket |
+| `/positions` | Posiciones abiertas |
+| `/config` | Configuración actual |
+| `/pause` | Pausar trading |
+| `/resume` | Reanudar trading |
 
-## Risk Management
+## Deployment (AWS)
 
-- Paper trading mode for testing
-- Max position size limits
-- Slippage checks before execution
-- Liquidity depth verification
-- Cooldown between trades
-- FOK orders prevent partial fills
+```bash
+# SSH al servidor
+ssh -i ~/.ssh/polymarket-bot-key.pem ubuntu@54.229.162.200
 
-## License
+# Ir al directorio
+cd ~/polymarket-hourly-bot
 
-MIT
+# Levantar
+docker compose up -d polymarket-hourly-bot
+
+# Ver logs
+docker logs -f polymarket-hourly-bot
+
+# Restart completo (limpia sesiones de Telegram)
+docker compose down && docker compose up -d polymarket-hourly-bot
+```
+
+### Fix permisos de data/
+
+Si hay error `SQLITE_CANTOPEN`:
+```bash
+sudo chown -R 1001:1001 ~/polymarket-hourly-bot/data
+```
+
+## Problemas conocidos
+
+### Error 409 Telegram
+```
+409 Conflict: terminated by other getUpdates request
+```
+
+**Causa**: Otra instancia usando el mismo token de Telegram, o tokens cruzados entre bots.
+
+**Solución**:
+```bash
+docker compose down && sleep 3 && docker compose up -d polymarket-hourly-bot
+```
+
+**Importante**: Cada bot (15m y 1h) debe tener su propio `TELEGRAM_BOT_TOKEN`.
+
+### Bot usando market cerrado (hora incorrecta)
+
+**Síntoma**: No recibe orderbook updates, market está "closed".
+
+**Causa**: El servidor está en UTC y el cálculo de hora ET estaba mal.
+
+**Solución**: Se usa `Intl.DateTimeFormat` con `formatToParts()` para extraer la hora correcta en ET:
+
+```typescript
+const etFormatter = new Intl.DateTimeFormat('en-US', {
+  timeZone: 'America/New_York',
+  hour: '2-digit',
+  hour12: false,
+});
+const parts = etFormatter.formatToParts(now);
+const etHour = parseInt(parts.find(p => p.type === 'hour')?.value || '0');
+```
+
+## Mercados monitoreados
+
+| Símbolo | Slug pattern |
+|---------|--------------|
+| BTC | `bitcoin-up-or-down-{month}-{day}-{hour}{ampm}-et` |
+| ETH | `ethereum-up-or-down-{month}-{day}-{hour}{ampm}-et` |
+| SOL | `solana-up-or-down-{month}-{day}-{hour}{ampm}-et` |
+| XRP | `xrp-up-or-down-{month}-{day}-{hour}{ampm}-et` |
+
+Ejemplo: `bitcoin-up-or-down-february-2-12pm-et`
+
+## Rotación de mercados
+
+Los markets de 1h rotan cada hora en punto (12pm, 1pm, 2pm, etc. ET).
+
+El bot:
+1. Pre-fetcha tokens del próximo market 5 minutos antes de la hora
+2. A la hora en punto, cambia al nuevo market
+3. Reconecta el WebSocket con los nuevos token IDs
+
+Los logs muestran:
+```
+⏰ HOURLY WINDOW ROTATION SCHEDULED
+  currentTime: 17:36:51
+  nextWindow: 18:00:00
+  prefetchAt: 17:55:00
+```

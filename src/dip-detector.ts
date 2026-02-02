@@ -1,42 +1,49 @@
 import { config } from './config.js';
 import { createChildLogger } from './logger.js';
 import { saveOrderbookSnapshot } from './db.js';
-import {
-  analyzeArbitrageLiquidity,
-  type AggregatedLiquidity,
-} from './liquidity-analyzer.js';
 import { getThreshold, getMaxPositionSize } from './runtime-config.js';
-import type { Orderbook, DipOpportunity, OrderbookLevel } from './types.js';
+import type { Orderbook, DipOpportunity, OrderbookLevel, MarketWindow } from './types.js';
 
 const log = createChildLogger('dip-detector');
 
 // Track last trade time per market for cooldown
 const lastTradeTime: Map<string, number> = new Map();
 
-// Track pending trades to prevent race conditions (duplicate trades)
+// Track pending trades to prevent race conditions
 const pendingTrades: Set<string> = new Set();
 
 // Track account balance for progressive sizing
 let currentBalance = config.trading.initialBalance;
 
-// Track active dips for duration analysis
-interface ActiveDip {
-  market: string;
-  startTime: number;
-  startCost: number;
-  minCost: number;
-  maxLiquidityUp: number;
-  maxLiquidityDown: number;
-  updates: number;
-}
-const activeDips: Map<string, ActiveDip> = new Map();
+// Minimum trade size in USDC
+const MIN_TRADE_USDC = 20;
+// Maximum trade size in USDC
+const MAX_TRADE_USDC = 100;
 
-// Target trade size for FOK analysis
-const TARGET_TRADE_SIZE = 100; // $100 USD
+/**
+ * Calculate the REAL fee rate for 15m markets based on price
+ * Formula: fee = 2 * (p * (1-p))^2
+ * - At p=0.50: fee = 2 * 0.0625 = 0.125 → ~1.56% (max)
+ * - At p=0.90: fee = 2 * 0.0081 = 0.0162 → ~0.16%
+ * - At p=0.10: fee = 2 * 0.0081 = 0.0162 → ~0.16%
+ *
+ * For 1h+ markets: fee = 0 (free)
+ */
+export function calculateRealFeeRate(price: number, timeframe: string): number {
+  // 1h and longer markets are FREE
+  if (timeframe !== '15m') {
+    return 0;
+  }
+
+  // 15m markets use the formula: 2 * (p * (1-p))^2
+  const pq = price * (1 - price);
+  const feeRate = 2 * pq * pq;
+
+  return feeRate;
+}
 
 /**
  * Calculate the average fill price for a given size using order book depth
- * Returns the volume-weighted average price (VWAP) for the requested size
  */
 export function calculateFillPrice(
   asks: OrderbookLevel[],
@@ -72,20 +79,10 @@ export function calculateFillPrice(
 }
 
 /**
- * Get total available liquidity across all levels up to a price limit
+ * Get total available liquidity across all levels
  */
-export function getTotalLiquidity(asks: OrderbookLevel[], maxPrice?: number): number {
-  return asks
-    .filter(level => maxPrice === undefined || level.price <= maxPrice)
-    .reduce((sum, level) => sum + level.size, 0);
-}
-
-/**
- * Calculate slippage: difference between best price and actual fill price
- */
-export function calculateSlippage(bestPrice: number, avgFillPrice: number): number {
-  if (bestPrice === 0) return 0;
-  return (avgFillPrice - bestPrice) / bestPrice;
+export function getTotalLiquidity(asks: OrderbookLevel[]): number {
+  return asks.reduce((sum, level) => sum + level.size, 0);
 }
 
 export function getCurrentBalance(): number {
@@ -107,16 +104,22 @@ export interface DetectionResult {
   skipReason?: string;
 }
 
+/**
+ * SIMPLIFIED DIP DETECTION
+ *
+ * Logic:
+ * 1. Is there a dip? (cost < threshold) → YES = TRADE
+ * 2. Minimum $20 USDC, maximum $100 USDC
+ * 3. FOK order handles the rest (fills what it can, kills the rest)
+ *
+ * NO complex liquidity/slippage pre-checks - just try to trade!
+ */
 export function detectDip(orderbook: Orderbook): DetectionResult {
   const { market, timestamp, UP, DOWN } = orderbook;
-  const { minProfit, cooldownMs, maxSlippagePct, minProfitAfterSlippage, riskPerTrade } = config.trading;
-  // Use runtime config for threshold and maxPositionSize (can be changed via Telegram)
+  const { cooldownMs } = config.trading;
   const threshold = getThreshold();
-  const maxPositionSize = getMaxPositionSize();
-  // Fee rate based on market timeframe (0% for 1h, 1.6% for 15m)
-  const feeRate = config.feeRates[config.marketTimeframe] ?? config.trading.feeRate;
 
-  // 🔒 Check if trade is already pending (prevents race condition / duplicate trades)
+  // Check if trade is already pending (prevents race condition / duplicate trades)
   if (pendingTrades.has(market)) {
     return {
       shouldTrade: false,
@@ -124,12 +127,12 @@ export function detectDip(orderbook: Orderbook): DetectionResult {
     };
   }
 
-  // Check cooldown
+  // Check cooldown (30 seconds between trades per market)
   const lastTrade = lastTradeTime.get(market) ?? 0;
   if (timestamp - lastTrade < cooldownMs) {
     return {
       shouldTrade: false,
-      skipReason: `Cooldown active (${Math.ceil((cooldownMs - (timestamp - lastTrade)) / 1000)}s remaining)`,
+      skipReason: `Cooldown active`,
     };
   }
 
@@ -137,7 +140,7 @@ export function detectDip(orderbook: Orderbook): DetectionResult {
   if (!UP.asks.length || !DOWN.asks.length) {
     return {
       shouldTrade: false,
-      skipReason: 'Empty orderbook (no asks)',
+      skipReason: 'Empty orderbook',
     };
   }
 
@@ -147,212 +150,169 @@ export function detectDip(orderbook: Orderbook): DetectionResult {
   if (!bestAskUp || !bestAskDown) {
     return {
       shouldTrade: false,
-      skipReason: 'Invalid orderbook data',
+      skipReason: 'Invalid orderbook',
     };
   }
 
-  // Minimum price check: reject if either side has unrealistic price
-  // This prevents false positives when new markets have no real liquidity
-  const MIN_REALISTIC_PRICE = 0.05; // 5 cents minimum per side
-  if (bestAskUp.price < MIN_REALISTIC_PRICE || bestAskDown.price < MIN_REALISTIC_PRICE) {
+  // Minimum price check (5 cents per side to filter garbage)
+  const MIN_PRICE = 0.05;
+  if (bestAskUp.price < MIN_PRICE || bestAskDown.price < MIN_PRICE) {
     return {
       shouldTrade: false,
-      skipReason: `Price too low (UP: $${bestAskUp.price.toFixed(3)}, DOWN: $${bestAskDown.price.toFixed(3)}) - likely no real liquidity`,
+      skipReason: `Price too low`,
     };
   }
 
-  // Best case cost (if we could fill at best ask)
-  const bestCaseCost = bestAskUp.price + bestAskDown.price;
+  // THE KEY CHECK: Is there a dip?
+  const totalCost = bestAskUp.price + bestAskDown.price;
 
-  // Calculate liquidity available for $100 FOK order
-  const sharesFor100Up = TARGET_TRADE_SIZE / bestAskUp.price;
-  const sharesFor100Down = TARGET_TRADE_SIZE / bestAskDown.price;
-  const targetSharesFor100 = Math.min(sharesFor100Up, sharesFor100Down);
-  const fillFor100Up = calculateFillPrice(UP.asks, targetSharesFor100);
-  const fillFor100Down = calculateFillPrice(DOWN.asks, targetSharesFor100);
-  const canFill100 = fillFor100Up.filledShares >= targetSharesFor100 * 0.95 &&
-                     fillFor100Down.filledShares >= targetSharesFor100 * 0.95;
-
-  // Quick check: if best case isn't profitable, skip
-  if (bestCaseCost >= threshold) {
-    // Check if a dip just ended
-    const activeDip = activeDips.get(market);
-    if (activeDip) {
-      const durationMs = timestamp - activeDip.startTime;
-      const durationSec = durationMs / 1000;
-
-      log.info({
-        market,
-        durationSec: durationSec.toFixed(1),
-        startCost: activeDip.startCost.toFixed(3),
-        minCost: activeDip.minCost.toFixed(3),
-        endCost: bestCaseCost.toFixed(3),
-        maxLiqUp: activeDip.maxLiquidityUp.toFixed(0),
-        maxLiqDown: activeDip.maxLiquidityDown.toFixed(0),
-        updates: activeDip.updates,
-      }, '⏱️ DIP ENDED - Duration tracking');
-
-      activeDips.delete(market);
-    }
-
+  if (totalCost >= threshold) {
     return {
       shouldTrade: false,
-      skipReason: `No dip (best cost $${bestCaseCost.toFixed(3)} >= threshold $${threshold})`,
+      skipReason: `No dip (${totalCost.toFixed(3)} >= ${threshold})`,
     };
   }
 
-  // We have a dip! Track it
-  const existingDip = activeDips.get(market);
-  if (!existingDip) {
-    // New dip starting
-    activeDips.set(market, {
+  // 🎯 DIP DETECTED! Calculate trade size and validate profitability
+
+  // How many shares can we get for MAX_TRADE_USDC?
+  const maxSharesUp = MAX_TRADE_USDC / bestAskUp.price;
+  const maxSharesDown = MAX_TRADE_USDC / bestAskDown.price;
+  const targetShares = Math.min(maxSharesUp, maxSharesDown);
+
+  // Check available liquidity (just for info, we'll try anyway with FOK)
+  const availableLiqUp = getTotalLiquidity(UP.asks);
+  const availableLiqDown = getTotalLiquidity(DOWN.asks);
+  const fillableShares = Math.min(targetShares, availableLiqUp, availableLiqDown);
+
+  // Calculate trade value
+  const tradeValue = fillableShares * totalCost;
+
+  // Check minimum trade size
+  if (tradeValue < MIN_TRADE_USDC) {
+    log.warn({
       market,
-      startTime: timestamp,
-      startCost: bestCaseCost,
-      minCost: bestCaseCost,
-      maxLiquidityUp: fillFor100Up.filledShares,
-      maxLiquidityDown: fillFor100Down.filledShares,
-      updates: 1,
-    });
+      tradeValue: tradeValue.toFixed(2),
+      minRequired: MIN_TRADE_USDC,
+      liqUp: availableLiqUp.toFixed(0),
+      liqDown: availableLiqDown.toFixed(0),
+    }, '❌ Trade too small');
+    return {
+      shouldTrade: false,
+      skipReason: `Trade too small ($${tradeValue.toFixed(0)} < $${MIN_TRADE_USDC})`,
+    };
+  }
 
-    log.info({
+  // Calculate expected profit using REAL fee rate based on prices
+  // Fee is calculated separately for UP and DOWN based on their prices
+  const feeRateUp = calculateRealFeeRate(bestAskUp.price, config.marketTimeframe);
+  const feeRateDown = calculateRealFeeRate(bestAskDown.price, config.marketTimeframe);
+  const costUp = fillableShares * bestAskUp.price;
+  const costDown = fillableShares * bestAskDown.price;
+  const estimatedFees = (costUp * feeRateUp) + (costDown * feeRateDown);
+
+  const grossProfit = (1.0 - totalCost) * fillableShares;
+  const expectedProfit = grossProfit - estimatedFees;
+  const profitPercent = (expectedProfit / tradeValue) * 100;
+  const effectiveFeeRate = estimatedFees / tradeValue;
+
+  // 🛑 CRITICAL: NEVER execute trades with negative or insufficient profit
+  const MIN_PROFIT_PCT = 1.0; // Require at least 1% profit after fees
+  if (profitPercent < MIN_PROFIT_PCT) {
+    log.warn({
       market,
-      cost: bestCaseCost.toFixed(3),
-      profitPct: ((1 - bestCaseCost) / bestCaseCost * 100).toFixed(1),
-      liqUp: fillFor100Up.filledShares.toFixed(0),
-      liqDown: fillFor100Down.filledShares.toFixed(0),
-      canFill100: canFill100 ? 'YES' : 'NO',
-    }, '🔔 DIP STARTED - $100 FOK analysis');
-  } else {
-    // Update existing dip
-    existingDip.minCost = Math.min(existingDip.minCost, bestCaseCost);
-    existingDip.maxLiquidityUp = Math.max(existingDip.maxLiquidityUp, fillFor100Up.filledShares);
-    existingDip.maxLiquidityDown = Math.max(existingDip.maxLiquidityDown, fillFor100Down.filledShares);
-    existingDip.updates++;
-  }
-
-  // Calculate how many shares we want to buy based on position sizing
-  const positionSize = Math.min(currentBalance * riskPerTrade, maxPositionSize);
-  // Estimate shares based on best ask prices
-  const estimatedSharesUp = positionSize / bestAskUp.price;
-  const estimatedSharesDown = positionSize / bestAskDown.price;
-  const targetShares = Math.min(estimatedSharesUp, estimatedSharesDown);
-
-  // Calculate actual fill prices using order book depth
-  const fillUp = calculateFillPrice(UP.asks, targetShares);
-  const fillDown = calculateFillPrice(DOWN.asks, targetShares);
-
-  // Check if we can fill the full order
-  if (fillUp.filledShares < targetShares * 0.9 || fillDown.filledShares < targetShares * 0.9) {
+      cost: totalCost.toFixed(3),
+      grossProfit: grossProfit.toFixed(2),
+      fees: estimatedFees.toFixed(2),
+      expectedProfit: expectedProfit.toFixed(2),
+      profitPct: profitPercent.toFixed(1) + '%',
+      feeRateUp: (feeRateUp * 100).toFixed(2) + '%',
+      feeRateDown: (feeRateDown * 100).toFixed(2) + '%',
+      effectiveFee: (effectiveFeeRate * 100).toFixed(2) + '%',
+      minRequired: MIN_PROFIT_PCT + '%',
+    }, '❌ REJECTED: Profit too low after fees (would lose money!)');
     return {
       shouldTrade: false,
-      skipReason: `Insufficient liquidity (UP: ${fillUp.filledShares.toFixed(0)}/${targetShares.toFixed(0)}, DOWN: ${fillDown.filledShares.toFixed(0)}/${targetShares.toFixed(0)})`,
+      skipReason: `Profit ${profitPercent.toFixed(1)}% < ${MIN_PROFIT_PCT}% min (fees: ${(effectiveFeeRate * 100).toFixed(1)}%)`,
     };
   }
 
-  // Use the minimum filled shares (we need equal amounts)
-  const actualShares = Math.min(fillUp.filledShares, fillDown.filledShares);
+  // Build market window info if available
+  let marketWindow: MarketWindow | undefined;
+  if (orderbook.windowOffset !== undefined && orderbook.windowLabel) {
+    // Calculate window times based on 15-minute periods
+    const periodSeconds = 15 * 60; // TODO: make configurable
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    const currentPeriodStart = Math.floor(nowSeconds / periodSeconds) * periodSeconds;
+    const windowStartSeconds = currentPeriodStart + (orderbook.windowOffset * periodSeconds);
 
-  // Recalculate with actual shares to get precise fill prices
-  const finalFillUp = calculateFillPrice(UP.asks, actualShares);
-  const finalFillDown = calculateFillPrice(DOWN.asks, actualShares);
-
-  // Calculate slippage
-  const slippageUp = calculateSlippage(bestAskUp.price, finalFillUp.avgPrice);
-  const slippageDown = calculateSlippage(bestAskDown.price, finalFillDown.avgPrice);
-  const totalSlippage = (slippageUp + slippageDown) / 2;
-
-  // Check max slippage
-  if (totalSlippage > maxSlippagePct) {
-    return {
-      shouldTrade: false,
-      skipReason: `Slippage too high (${(totalSlippage * 100).toFixed(2)}% > ${(maxSlippagePct * 100).toFixed(2)}%)`,
+    marketWindow = {
+      offset: orderbook.windowOffset,
+      label: orderbook.windowLabel,
+      startTime: new Date(windowStartSeconds * 1000),
+      endTime: new Date((windowStartSeconds + periodSeconds) * 1000),
     };
   }
 
-  // Calculate actual cost and profit using fill prices (including fees)
-  const actualTotalCost = finalFillUp.avgPrice + finalFillDown.avgPrice;
-  const estimatedFees = actualTotalCost * feeRate;
-  const expectedProfit = 1.0 - actualTotalCost - estimatedFees;
-  const profitPercent = (expectedProfit / actualTotalCost) * 100;
-
-  // Check if still profitable after slippage and fees
-  if (profitPercent < minProfitAfterSlippage * 100) {
-    return {
-      shouldTrade: false,
-      skipReason: `Profit after slippage+fees too low (${profitPercent.toFixed(2)}% < ${(minProfitAfterSlippage * 100).toFixed(2)}%)`,
-    };
-  }
-
-  // Check minimum profit (after fees)
-  if (expectedProfit < minProfit) {
-    return {
-      shouldTrade: false,
-      skipReason: `Profit after fees too small ($${expectedProfit.toFixed(3)} < min $${minProfit})`,
-    };
-  }
-
-  // Found a valid dip with acceptable slippage!
+  // Build opportunity
   const opportunity: DipOpportunity = {
     market,
     timestamp,
+    marketWindow,
     askUp: bestAskUp.price,
     askDown: bestAskDown.price,
-    avgFillPriceUp: finalFillUp.avgPrice,
-    avgFillPriceDown: finalFillDown.avgPrice,
-    totalCost: actualTotalCost,
-    bestCaseCost,
+    avgFillPriceUp: bestAskUp.price,
+    avgFillPriceDown: bestAskDown.price,
+    totalCost,
+    bestCaseCost: totalCost,
     expectedProfit,
     profitPercent,
-    slippageUp,
-    slippageDown,
-    totalSlippage,
-    liquidityUp: getTotalLiquidity(UP.asks),
-    liquidityDown: getTotalLiquidity(DOWN.asks),
-    levelsUsedUp: finalFillUp.levels,
-    levelsUsedDown: finalFillDown.levels,
-    detectedAt: performance.now(), // High-res timestamp for latency tracking
+    slippageUp: 0,
+    slippageDown: 0,
+    totalSlippage: 0,
+    liquidityUp: availableLiqUp,
+    liquidityDown: availableLiqDown,
+    levelsUsedUp: 1,
+    levelsUsedDown: 1,
+    detectedAt: performance.now(),
   };
 
+  // LOG IT AND GO!
+  const windowStr = marketWindow ? ` [${marketWindow.label}]` : '';
   log.info(
     {
       market,
-      bestCost: bestCaseCost.toFixed(3),
-      actualCost: actualTotalCost.toFixed(3),
-      fees: estimatedFees.toFixed(3),
-      slippage: `${(totalSlippage * 100).toFixed(2)}%`,
-      netProfit: expectedProfit.toFixed(3),
-      profitPct: profitPercent.toFixed(1),
-      levelsUp: finalFillUp.levels,
-      levelsDown: finalFillDown.levels,
+      window: marketWindow?.label ?? 'now',
+      cost: totalCost.toFixed(3),
+      threshold,
+      discount: ((1 - totalCost) * 100).toFixed(1) + '%',
+      shares: fillableShares.toFixed(0),
+      tradeUSDC: tradeValue.toFixed(0),
+      fees: estimatedFees.toFixed(2),
+      feeRate: (effectiveFeeRate * 100).toFixed(2) + '%',
+      expectedProfit: expectedProfit.toFixed(2),
+      profitPct: profitPercent.toFixed(1) + '%',
+      liqUp: availableLiqUp.toFixed(0),
+      liqDown: availableLiqDown.toFixed(0),
     },
-    '🎯 DIP DETECTED (slippage + fees accounted)!'
+    `🎯 DIP DETECTED${windowStr} - EXECUTING TRADE!`
   );
 
-  // Save orderbook snapshot for slippage analysis
+  // Save snapshot for analysis
   try {
-    // Calculate liquidity within 5% of best ask
-    const liquidityUp5pct = UP.asks
-      .filter(l => l.price <= bestAskUp.price * 1.05)
-      .reduce((sum, l) => sum + l.size, 0);
-    const liquidityDown5pct = DOWN.asks
-      .filter(l => l.price <= bestAskDown.price * 1.05)
-      .reduce((sum, l) => sum + l.size, 0);
-
     saveOrderbookSnapshot({
       timestamp,
       market,
       bestAskUp: bestAskUp.price,
       bestAskDown: bestAskDown.price,
-      totalCost: bestCaseCost,
-      liquidityUp5pct,
-      liquidityDown5pct,
-      depthUp: UP.asks.slice(0, 10), // Save top 10 levels
-      depthDown: DOWN.asks.slice(0, 10),
+      totalCost,
+      liquidityUp5pct: availableLiqUp,
+      liquidityDown5pct: availableLiqDown,
+      depthUp: UP.asks.slice(0, 5),
+      depthDown: DOWN.asks.slice(0, 5),
     });
-    log.debug({ market, levels: UP.asks.length }, 'Orderbook snapshot saved');
   } catch (err) {
-    log.warn({ err, market }, 'Failed to save orderbook snapshot');
+    log.warn({ err, market }, 'Failed to save snapshot');
   }
 
   return {
@@ -386,20 +346,17 @@ export function getCooldownRemaining(market: string): number {
   return Math.max(0, config.trading.cooldownMs - elapsed);
 }
 
-// Simple position size calculation (for backwards compatibility)
+// Simple position size calculation
 // IMPORTANT: maxPositionSize is the TOTAL cost (UP + DOWN combined), not per-side
 export function calculatePositionSize(opportunity: DipOpportunity): {
   sizeUp: number;
   sizeDown: number;
   totalCost: number;
 } {
-  const { riskPerTrade } = config.trading;
   const maxPositionSize = getMaxPositionSize();
 
-  // Progressive sizing: risk% of current balance, capped by maxPositionSize
-  // This is the TOTAL budget for the trade (both sides combined)
-  const riskBasedSize = currentBalance * riskPerTrade;
-  const totalBudget = Math.min(riskBasedSize, maxPositionSize);
+  // Total budget is the smaller of MAX_TRADE_USDC or maxPositionSize
+  const totalBudget = Math.min(MAX_TRADE_USDC, maxPositionSize);
 
   // Calculate shares based on TOTAL cost (UP + DOWN)
   // shares = totalBudget / (priceUp + priceDown)
@@ -409,16 +366,13 @@ export function calculatePositionSize(opportunity: DipOpportunity): {
   // Limit by available liquidity on each side
   const shares = Math.min(maxSharesByBudget, opportunity.liquidityUp, opportunity.liquidityDown);
 
-  const costUp = shares * opportunity.askUp;
-  const costDown = shares * opportunity.askDown;
-  const actualTotalCost = costUp + costDown;
+  const actualTotalCost = shares * totalCostPerShare;
 
   log.debug({
-    balance: currentBalance.toFixed(2),
-    riskPct: (riskPerTrade * 100).toFixed(0),
     totalBudget: totalBudget.toFixed(2),
     priceUp: opportunity.askUp.toFixed(3),
     priceDown: opportunity.askDown.toFixed(3),
+    totalCostPerShare: totalCostPerShare.toFixed(3),
     shares: shares.toFixed(2),
     actualTotalCost: actualTotalCost.toFixed(2),
   }, '📐 Position sizing');
@@ -430,109 +384,50 @@ export function calculatePositionSize(opportunity: DipOpportunity): {
   };
 }
 
-// Extended position sizing result with liquidity analysis
+// Extended sizing result (simplified)
 export interface ExtendedSizingResult {
   sizeUp: number;
   sizeDown: number;
   totalCost: number;
-  liquidityAnalysis: AggregatedLiquidity;
+  liquidityAnalysis: { up: { availableSize: number }; down: { availableSize: number }; combinedSlippage: number; adjustedProfit: number };
   estimatedSlippage: number;
   adjustedProfit: number;
   viable: boolean;
   reason?: string;
 }
 
-// Simple FAK (Fill and Kill) position sizing: 50-200 USDC TOTAL (both sides combined)
-// FAK fills as much as possible at best prices, cancels unfilled portion
-const MIN_TRADE_USDC = 50;
-const MAX_TRADE_USDC = 200;
-
-// Calculate position size with FAK logic (fill what's available, 50-200 USDC TOTAL)
+// Simplified position sizing - just return viable=true, let FOK handle it
 export function calculatePositionSizeWithLiquidity(
   opportunity: DipOpportunity,
   orderbook: Orderbook
 ): ExtendedSizingResult {
-  // Total cost per share = priceUp + priceDown
-  const totalCostPerShare = opportunity.askUp + opportunity.askDown;
+  const { sizeUp, sizeDown, totalCost } = calculatePositionSize(opportunity);
 
-  // Calculate max shares we can get with MAX_TRADE_USDC total budget
-  const maxSharesByBudget = MAX_TRADE_USDC / totalCostPerShare;
-
-  // Analyze what we can actually fill
-  const analysis = analyzeArbitrageLiquidity(
-    orderbook.UP.asks,
-    orderbook.DOWN.asks,
-    maxSharesByBudget
-  );
-
-  // How many shares can we actually fill on both sides?
-  const fillableShares = Math.min(analysis.up.availableSize, analysis.down.availableSize);
-
-  // Convert back to USDC value (total cost = shares × (priceUp + priceDown))
-  const fillableUSDC = fillableShares * totalCostPerShare;
-
-  // FOK logic: use what's available between MIN and MAX
-  let tradeShares = fillableShares;
-  let viable = true;
-  let reason: string | undefined;
-
-  if (fillableUSDC < MIN_TRADE_USDC) {
-    viable = false;
-    reason = `Insufficient liquidity ($${fillableUSDC.toFixed(0)} < $${MIN_TRADE_USDC} min)`;
-    tradeShares = 0;
-  } else if (fillableUSDC > MAX_TRADE_USDC) {
-    // Cap at max budget, recalculate shares
-    tradeShares = MAX_TRADE_USDC / totalCostPerShare;
-  }
-
-  // Calculate actual cost
-  const costUp = tradeShares * opportunity.avgFillPriceUp;
-  const costDown = tradeShares * opportunity.avgFillPriceDown;
-  const totalCost = costUp + costDown;
-
-  log.info({
-    market: opportunity.market,
-    fillableUSDC: fillableUSDC.toFixed(0),
-    tradeShares: tradeShares.toFixed(1),
-    totalCost: totalCost.toFixed(2),
-    viable,
-  }, viable ? '✅ FAK viable' : '❌ FAK insufficient liquidity');
-
+  // Always viable - FOK will handle liquidity issues
   return {
-    sizeUp: tradeShares,
-    sizeDown: tradeShares,
+    sizeUp,
+    sizeDown,
     totalCost,
-    liquidityAnalysis: analysis,
-    estimatedSlippage: analysis.combinedSlippage,
-    adjustedProfit: analysis.adjustedProfit,
-    viable,
-    reason,
+    liquidityAnalysis: {
+      up: { availableSize: opportunity.liquidityUp },
+      down: { availableSize: opportunity.liquidityDown },
+      combinedSlippage: 0,
+      adjustedProfit: opportunity.expectedProfit,
+    },
+    estimatedSlippage: 0,
+    adjustedProfit: opportunity.expectedProfit,
+    viable: true,
   };
 }
 
-// Validate that orderbook depth supports our trade size
+// Backwards compatibility
 export function validateLiquidity(
   opportunity: DipOpportunity,
   requiredSize: number
 ): { valid: boolean; reason?: string } {
-  if (opportunity.liquidityUp < requiredSize) {
-    return {
-      valid: false,
-      reason: `Insufficient UP liquidity (${opportunity.liquidityUp} < ${requiredSize})`,
-    };
-  }
-
-  if (opportunity.liquidityDown < requiredSize) {
-    return {
-      valid: false,
-      reason: `Insufficient DOWN liquidity (${opportunity.liquidityDown} < ${requiredSize})`,
-    };
-  }
-
-  return { valid: true };
+  return { valid: true }; // Let FOK handle it
 }
 
-// Get active dips info for monitoring
 export function getActiveDips(): Array<{
   market: string;
   durationSec: number;
@@ -542,14 +437,5 @@ export function getActiveDips(): Array<{
   maxLiquidityDown: number;
   updates: number;
 }> {
-  const now = Date.now();
-  return Array.from(activeDips.values()).map(dip => ({
-    market: dip.market,
-    durationSec: (now - dip.startTime) / 1000,
-    startCost: dip.startCost,
-    minCost: dip.minCost,
-    maxLiquidityUp: dip.maxLiquidityUp,
-    maxLiquidityDown: dip.maxLiquidityDown,
-    updates: dip.updates,
-  }));
+  return []; // Simplified - no tracking
 }

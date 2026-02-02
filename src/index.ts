@@ -37,6 +37,7 @@ import {
   getMarketTokens,
   getOrderbook,
   stopOrderbookStreams,
+  getAndResetMessageCounts,
 } from './market-data.js';
 import {
   detectDip,
@@ -55,10 +56,28 @@ const log = createChildLogger('main');
 let isRunning = false;
 let statsInterval: NodeJS.Timeout | null = null;
 let priceLogInterval: NodeJS.Timeout | null = null;
-let summaryInterval: NodeJS.Timeout | null = null;
+let summaryTimeout: NodeJS.Timeout | null = null;
 let dailySummaryInterval: NodeJS.Timeout | null = null;
 let tradesThisPeriod = 0;
 let volumeThisPeriod = 0;
+
+/**
+ * Calculate milliseconds until next 15-minute clock boundary
+ * Boundaries: :00, :15, :30, :45
+ */
+function getMsUntilNext15MinBoundary(): { ms: number; nextTime: Date } {
+  const now = new Date();
+  const minutes = now.getMinutes();
+  const seconds = now.getSeconds();
+  const milliseconds = now.getMilliseconds();
+
+  // Find next 15-minute boundary
+  const minutesUntilBoundary = 15 - (minutes % 15);
+  const msUntilBoundary = (minutesUntilBoundary * 60 * 1000) - (seconds * 1000) - milliseconds;
+
+  const nextTime = new Date(now.getTime() + msUntilBoundary);
+  return { ms: msUntilBoundary, nextTime };
+}
 
 async function main(): Promise<void> {
   log.info('Starting Polymarket Dip Arbitrage Bot');
@@ -121,8 +140,9 @@ async function main(): Promise<void> {
       }
     }, 30000);
 
-    // Send 15-minute summary to Telegram
-    summaryInterval = setInterval(async () => {
+    // Send 15-minute summary to Telegram (aligned to clock :00, :15, :30, :45)
+    async function sendAndScheduleNextSummary(): Promise<void> {
+      // Send summary
       const prices: PriceSummary[] = [];
       for (const market of config.markets) {
         const ob = getOrderbook(market.symbol);
@@ -140,12 +160,17 @@ async function main(): Promise<void> {
       const recentPositions = getPositionsLast15Min();
       const resolvedPositions = recentPositions.filter(p => p.status === 'resolved');
 
+      // Get WebSocket message counts for this period
+      const wsCounts = getAndResetMessageCounts();
+
       const sessionStats: SessionStats = {
         tradesExecuted: tradesThisPeriod,
         tradesResolved: resolvedPositions.length,
         totalVolume: volumeThisPeriod,
         totalProfit: resolvedPositions.reduce((sum, p) => sum + (p.actualProfit ?? 0), 0),
         totalFees: resolvedPositions.reduce((sum, p) => sum + (p.fees ?? 0), 0),
+        wsMessages: wsCounts.messages,
+        wsUpdates: wsCounts.updates,
       };
 
       await notify15MinSummary(prices, sessionStats, config.paperTrading);
@@ -153,7 +178,19 @@ async function main(): Promise<void> {
       // Reset counters for next period
       tradesThisPeriod = 0;
       volumeThisPeriod = 0;
-    }, 15 * 60 * 1000); // Every 15 minutes
+
+      // Schedule next summary aligned to clock
+      if (isRunning) {
+        const { ms, nextTime } = getMsUntilNext15MinBoundary();
+        log.info({ nextSummary: nextTime.toISOString(), msUntil: ms }, '⏰ Next summary scheduled');
+        summaryTimeout = setTimeout(sendAndScheduleNextSummary, ms);
+      }
+    }
+
+    // Schedule first summary at next 15-minute boundary
+    const { ms: initialDelay, nextTime } = getMsUntilNext15MinBoundary();
+    log.info({ firstSummary: nextTime.toISOString(), msUntil: initialDelay }, '⏰ First summary scheduled (clock-aligned)');
+    summaryTimeout = setTimeout(sendAndScheduleNextSummary, initialDelay);
 
     // Send daily summary at midnight (or every 24h from start)
     dailySummaryInterval = setInterval(async () => {
@@ -338,8 +375,8 @@ async function shutdown(signal: string): Promise<void> {
   if (priceLogInterval) {
     clearInterval(priceLogInterval);
   }
-  if (summaryInterval) {
-    clearInterval(summaryInterval);
+  if (summaryTimeout) {
+    clearTimeout(summaryTimeout);
   }
   if (dailySummaryInterval) {
     clearInterval(dailySummaryInterval);

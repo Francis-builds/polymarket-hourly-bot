@@ -510,8 +510,6 @@ async function handleClaimCommand(msg: TelegramBot.Message): Promise<void> {
     return;
   }
 
-  // TODO: Implementar claim automático via API
-  // Por ahora mostramos instrucciones manuales
   await bot?.sendMessage(
     msg.chat.id,
     `🎁 <b>PROCEEDS SIN RECLAMAR</b>\n\n` +
@@ -639,7 +637,7 @@ async function handleThresholdCommand(msg: TelegramBot.Message, match: RegExpExe
     `✅ <b>Threshold actualizado</b>\n\n` +
     `Anterior: ${oldValue}\n` +
     `Nuevo: <b>${value}</b>\n\n` +
-    `Los trades se ejecutarán cuando total &lt; ${value}`,
+    `Los trades se ejecutarán cuando total < ${value}`,
     { parse_mode: 'HTML' }
   );
 }
@@ -825,10 +823,19 @@ ${isLiveTrading ? '🔴 Modo: LIVE TRADING' : '📝 Modo: PAPER (usa /golive par
 }
 
 export async function notifyDipDetected(dip: DipOpportunity): Promise<void> {
+  // Format window info
+  let windowInfo = '';
+  if (dip.marketWindow) {
+    const startTime = dip.marketWindow.startTime.toISOString().substring(11, 16);
+    const endTime = dip.marketWindow.endTime.toISOString().substring(11, 16);
+    const windowLabel = dip.marketWindow.label === 'now' ? '🟢 NOW' : `🔮 ${dip.marketWindow.label}`;
+    windowInfo = `\nWindow: ${windowLabel} (${startTime}-${endTime} UTC)`;
+  }
+
   const msg = `
 🎯 <b>DIP DETECTED!</b>
 
-Market: ${dip.market}
+Market: ${dip.market}${windowInfo}
 UP ask: $${dip.askUp.toFixed(3)}
 DOWN ask: $${dip.askDown.toFixed(3)}
 Total: $${dip.totalCost.toFixed(3)}
@@ -963,6 +970,8 @@ export interface SessionStats {
   totalVolume: number;
   totalProfit: number;
   totalFees: number;
+  wsMessages?: number;
+  wsUpdates?: number;
 }
 
 export async function notify15MinSummary(
@@ -997,6 +1006,14 @@ export async function notify15MinSummary(
     volumeStr = `\n📊 Volumen: $${sessionStats.totalVolume.toFixed(2)}`;
   }
 
+  // WebSocket stats
+  let wsStr = '';
+  if (sessionStats.wsMessages !== undefined && sessionStats.wsMessages > 0) {
+    const msgK = (sessionStats.wsMessages / 1000).toFixed(1);
+    const updK = ((sessionStats.wsUpdates ?? 0) / 1000).toFixed(1);
+    wsStr = `\n📡 WS: ${msgK}k msgs / ${updK}k updates`;
+  }
+
   const priceLines = prices.map(p => {
     const dipStatus = p.total < 0.96 ? '🎯 DIP!' : p.total < 0.98 ? '👀' : '➖';
     return `${p.symbol}: $${p.total.toFixed(3)} ${dipStatus}`;
@@ -1006,7 +1023,7 @@ export async function notify15MinSummary(
 ⏰ <b>Resumen 15min</b> (${timeStr})
 ${modeStr}
 
-${tradeStr}${resolveStr}${volumeStr}
+${tradeStr}${resolveStr}${volumeStr}${wsStr}
 
 <b>Precios:</b>
 <code>${priceLines}</code>
