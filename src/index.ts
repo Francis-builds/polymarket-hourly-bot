@@ -40,7 +40,9 @@ import {
 } from './market-data.js';
 import {
   detectDip,
+  markTradePending,
   markTradeExecuted,
+  clearTradePending,
   calculatePositionSizeWithLiquidity,
   updateBalance,
   getCurrentBalance,
@@ -271,6 +273,9 @@ async function handleOrderbookUpdate(orderbook: Orderbook): Promise<void> {
       '🎯 Executing dip trade (liquidity checked)'
     );
 
+    // 🔒 Mark trade as pending BEFORE execution to prevent duplicates
+    markTradePending(opportunity.market);
+
     // Execute the trade
     const result = await executeDipTrade(
       opportunity,
@@ -304,6 +309,9 @@ async function handleOrderbookUpdate(orderbook: Orderbook): Promise<void> {
       // Notify success
       await notifyTradeExecuted(position);
     } else {
+      // 🔓 Clear pending state on failure
+      clearTradePending(opportunity.market);
+
       // Log failure
       logEvent('trade_failed', {
         market: opportunity.market,

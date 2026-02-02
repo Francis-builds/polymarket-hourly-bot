@@ -13,6 +13,9 @@ const log = createChildLogger('dip-detector');
 // Track last trade time per market for cooldown
 const lastTradeTime: Map<string, number> = new Map();
 
+// Track pending trades to prevent race conditions (duplicate trades)
+const pendingTrades: Set<string> = new Set();
+
 // Track account balance for progressive sizing
 let currentBalance = config.trading.initialBalance;
 
@@ -110,8 +113,16 @@ export function detectDip(orderbook: Orderbook): DetectionResult {
   // Use runtime config for threshold and maxPositionSize (can be changed via Telegram)
   const threshold = getThreshold();
   const maxPositionSize = getMaxPositionSize();
-  // Fee rate based on market timeframe (0% for 1h, 3% for 15m)
+  // Fee rate based on market timeframe (0% for 1h, 1.6% for 15m)
   const feeRate = config.feeRates[config.marketTimeframe] ?? config.trading.feeRate;
+
+  // 🔒 Check if trade is already pending (prevents race condition / duplicate trades)
+  if (pendingTrades.has(market)) {
+    return {
+      shouldTrade: false,
+      skipReason: `Trade already pending`,
+    };
+  }
 
   // Check cooldown
   const lastTrade = lastTradeTime.get(market) ?? 0;
@@ -350,8 +361,23 @@ export function detectDip(orderbook: Orderbook): DetectionResult {
   };
 }
 
+// Mark trade as pending BEFORE execution (prevents race condition)
+export function markTradePending(market: string): void {
+  pendingTrades.add(market);
+  log.debug({ market }, '🔒 Trade marked as pending');
+}
+
+// Mark trade as executed AFTER completion (clears pending, sets cooldown)
 export function markTradeExecuted(market: string): void {
+  pendingTrades.delete(market);
   lastTradeTime.set(market, Date.now());
+  log.debug({ market }, '✅ Trade executed, cooldown started');
+}
+
+// Clear pending state if trade fails
+export function clearTradePending(market: string): void {
+  pendingTrades.delete(market);
+  log.debug({ market }, '🔓 Trade pending cleared (failed or cancelled)');
 }
 
 export function getCooldownRemaining(market: string): number {
