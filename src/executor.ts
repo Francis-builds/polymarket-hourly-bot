@@ -5,6 +5,9 @@ import type { DipOpportunity, Position, TradeResult } from './types.js';
 
 const log = createChildLogger('executor');
 
+// CLOB Client host URL
+const CLOB_HOST = 'https://clob.polymarket.com';
+
 // Helper to check if we should use paper trading
 function isPaperMode(): boolean {
   return !isLiveTradingEnabled();
@@ -17,35 +20,14 @@ let paperStats = {
   simulatedProfit: 0,
 };
 
-// poly-sdk types (will be properly typed when we install the package)
-interface PolymarketSDK {
-  tradingService: {
-    createMarketOrder(args: {
-      tokenId: string;
-      side: 'BUY' | 'SELL';
-      amount: number;
-      orderType: 'FOK' | 'GTC';
-    }): Promise<{ orderId: string; filledSize: number; avgPrice: number }>;
-    getOpenOrders(): Promise<unknown[]>;
-    cancelOrder(orderId: string): Promise<void>;
-  };
-  marketService: {
-    getOrderbook(tokenId: string): Promise<{
-      bids: Array<{ price: number; size: number }>;
-      asks: Array<{ price: number; size: number }>;
-    }>;
-    getMidpoint(tokenId: string): Promise<number>;
-  };
-  initialize(): Promise<void>;
-  connect(): void;
-  waitForConnection(): Promise<void>;
-}
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let clobClient: any = null;
 
-interface PolymarketSDKConstructor {
-  create(options: { privateKey: string; chainId: number }): Promise<PolymarketSDK>;
-}
-
-let sdk: PolymarketSDK | null = null;
+// Will be set on init from the SDK
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let Side: any;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let OrderType: any;
 
 export async function initExecutor(): Promise<void> {
   // Skip SDK initialization in paper trading mode
@@ -55,28 +37,59 @@ export async function initExecutor(): Promise<void> {
   }
 
   try {
-    // Dynamic import of Polymarket CLOB client
-    // Note: Real trading requires @polymarket/clob-client to be properly configured
-    const { ClobClient } = await import('@polymarket/clob-client');
+    // Dynamic import of required modules
+    const clobModule = await import('@polymarket/clob-client');
+    const { ClobClient, Side: SideEnum, OrderType: OrderTypeEnum } = clobModule;
+    // Dynamic import for ESM compatibility
+    const ethersModule = await import('ethers');
+    const { Wallet } = ethersModule;
 
-    // For real trading, we'll need to set up the CLOB client properly
-    // This is a placeholder - actual implementation would configure signatures, etc.
-    log.info('Polymarket CLOB client loaded (real trading not yet implemented)');
+    // Set SDK enums
+    Side = SideEnum;
+    OrderType = OrderTypeEnum;
 
-    // TODO: Implement real trading with @polymarket/clob-client
-    // sdk = new ClobClient(...)
+    // Validate API credentials
+    if (!config.clobApi.key || !config.clobApi.secret || !config.clobApi.passphrase) {
+      throw new Error('Missing CLOB API credentials. Set POLYMARKET_API_KEY, POLYMARKET_API_SECRET, POLYMARKET_API_PASSPHRASE');
+    }
+
+    // Create wallet signer from private key
+    const signer = new Wallet(config.privateKey);
+    const walletAddress = await signer.getAddress();
+
+    log.info({ walletAddress }, 'Initializing Polymarket CLOB client');
+
+    // Initialize CLOB client with credentials
+    const apiCreds = {
+      key: config.clobApi.key,
+      secret: config.clobApi.secret,
+      passphrase: config.clobApi.passphrase,
+    };
+
+    // ClobClient constructor: (host, chainId, signer, creds, signatureType)
+    // signatureType: 0 = EOA, 1 = POLY_GNOSIS_SAFE, 2 = POLY_PROXY
+    clobClient = new ClobClient(
+      CLOB_HOST,
+      config.chainId,
+      signer,
+      apiCreds,
+      0 // EOA signature type
+    );
+
+    log.info('✅ Polymarket CLOB client initialized - REAL TRADING ENABLED');
 
   } catch (error) {
-    log.error({ error }, 'Failed to initialize Polymarket SDK');
+    log.error({ error }, 'Failed to initialize Polymarket CLOB client');
     throw error;
   }
 }
 
-export function getSDK(): PolymarketSDK {
-  if (!sdk) {
-    throw new Error('Executor not initialized. Call initExecutor() first.');
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export function getClobClient(): any {
+  if (!clobClient) {
+    throw new Error('CLOB client not initialized. Call initExecutor() first.');
   }
-  return sdk;
+  return clobClient;
 }
 
 // Execute a dip arbitrage trade (buy both UP and DOWN)
@@ -111,8 +124,7 @@ export async function executeDipTrade(
     return executePaperTrade(opportunity, sizeUp, sizeDown, positionId, executionStart);
   }
 
-  // Real trading mode
-  const sdk = getSDK();
+  // Real trading mode - using CLOB client
 
   try {
     // Execute both orders as FOK (Fill-or-Kill) to avoid partial fills
@@ -266,24 +278,56 @@ async function executeOrder(
   amount: number,
   orderType: 'FOK' | 'GTC'
 ): Promise<TradeResult> {
-  const sdk = getSDK();
+  const client = getClobClient();
 
   try {
-    const result = await sdk.tradingService.createMarketOrder({
-      tokenId,
-      side,
-      amount,
-      orderType,
-    });
+    log.debug(
+      { tokenId: tokenId.substring(0, 16) + '...', side, amount, orderType },
+      'Executing CLOB order'
+    );
+
+    // Get fee rate (0% for hourly markets)
+    const feeRateBps = Math.round((config.feeRates?.[config.marketTimeframe] ?? 0) * 10000);
+
+    // Execute market order via CLOB
+    const result = await client.createAndPostMarketOrder(
+      {
+        tokenID: tokenId,
+        amount: amount, // Amount in USDC
+        side: side === 'BUY' ? Side.BUY : Side.SELL,
+        feeRateBps,
+      },
+      { negRisk: false, tickSize: '0.01' },
+      orderType === 'FOK' ? OrderType.FOK : OrderType.GTC
+    );
+
+    // Check for errors
+    if (result.errorMsg) {
+      log.warn({ result }, 'CLOB order returned error');
+      return {
+        success: false,
+        error: result.errorMsg,
+      };
+    }
+
+    log.info(
+      {
+        orderId: result.orderID,
+        txHash: result.transactionHash,
+        status: result.status,
+      },
+      '✅ CLOB order executed'
+    );
 
     return {
       success: true,
-      orderId: result.orderId,
-      filledSize: result.filledSize,
-      filledPrice: result.avgPrice,
+      orderId: result.orderID ?? result.transactionHash,
+      filledSize: amount, // Market orders fill fully or fail
+      filledPrice: undefined, // Would need to query for actual fill price
     };
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : String(error);
+    log.error({ error, tokenId: tokenId.substring(0, 16) + '...' }, 'CLOB order failed');
     return {
       success: false,
       error: errorMsg,
@@ -293,14 +337,20 @@ async function executeOrder(
 
 // Get current orderbook for a token
 export async function getOrderbook(tokenId: string) {
-  const sdk = getSDK();
-  return sdk.marketService.getOrderbook(tokenId);
+  const client = getClobClient();
+  const book = await client.getOrderBook(tokenId);
+
+  return {
+    bids: book.bids.map((b: { price: string; size: string }) => ({ price: parseFloat(b.price), size: parseFloat(b.size) })),
+    asks: book.asks.map((a: { price: string; size: string }) => ({ price: parseFloat(a.price), size: parseFloat(a.size) })),
+  };
 }
 
 // Get midpoint price
 export async function getMidpoint(tokenId: string): Promise<number> {
-  const sdk = getSDK();
-  return sdk.marketService.getMidpoint(tokenId);
+  const client = getClobClient();
+  const midpoint = await client.getMidpoint(tokenId);
+  return parseFloat(midpoint);
 }
 
 function generatePositionId(): string {
@@ -309,7 +359,7 @@ function generatePositionId(): string {
   return `pos_${timestamp}_${random}`;
 }
 
-// Check if we can execute (SDK is ready or paper mode)
+// Check if we can execute (CLOB client is ready or paper mode)
 export function isReady(): boolean {
-  return isPaperMode() || sdk !== null;
+  return isPaperMode() || clobClient !== null;
 }
