@@ -27,6 +27,17 @@ export const config = {
   polygonRpcUrl: requireEnvUnlessPaper('POLYGON_RPC_URL', 'https://polygon-rpc.com'),
   chainId: 137, // Polygon mainnet
 
+  // Polymarket CLOB API Credentials (required for real trading)
+  // Generate these at https://polymarket.com/settings -> API Keys
+  clobApi: {
+    key: requireEnvUnlessPaper('POLYMARKET_API_KEY', ''),
+    secret: requireEnvUnlessPaper('POLYMARKET_API_SECRET', ''),
+    passphrase: requireEnvUnlessPaper('POLYMARKET_API_PASSPHRASE', ''),
+  },
+
+  // Polymarket proxy wallet address (for accounts created via Polymarket.com)
+  proxyWalletAddress: optionalEnv('POLYMARKET_PROXY_ADDRESS', ''),
+
   // Telegram (optional in paper mode - logs to console)
   telegram: {
     botToken: optionalEnv('TELEGRAM_BOT_TOKEN', ''),
