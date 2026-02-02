@@ -1,7 +1,7 @@
 services:
-  polymarket-bot:
+  polymarket-hourly-bot:
     build: .
-    container_name: polymarket-dip-bot
+    container_name: polymarket-hourly-bot
     restart: unless-stopped
     env_file:
       - .env
@@ -18,41 +18,3 @@ services:
       timeout: 10s
       retries: 3
       start_period: 10s
-
-  moltbot:
-    image: ghcr.io/moltbot/moltbot:main
-    container_name: moltbot
-    restart: unless-stopped
-    env_file:
-      - .env.moltbot
-    volumes:
-      - moltbot-config:/home/node/.clawdbot
-      - moltbot-workspace:/home/node/clawd
-      - ./moltbot.json:/home/node/.clawdbot/moltbot.json:ro
-      - /var/run/docker.sock:/var/run/docker.sock  # Para sandboxing
-    ports:
-      - "127.0.0.1:18789:18789"  # Gateway UI (solo localhost)
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:18789/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 30s
-
-volumes:
-  moltbot-config:
-  moltbot-workspace:
-
-  # Optional: Watchtower for auto-updates
-  # watchtower:
-  #   image: containrrr/watchtower
-  #   container_name: watchtower
-  #   restart: unless-stopped
-  #   volumes:
-  #     - /var/run/docker.sock:/var/run/docker.sock
-  #   command: --interval 3600 polymarket-dip-bot moltbot
