@@ -66,24 +66,15 @@ export async function initExecutor(): Promise<void> {
       passphrase: config.clobApi.passphrase,
     };
 
-    // ClobClient constructor: (host, chainId, signer, creds, signatureType, funder)
-    // signatureType: 2 = GNOSIS_SAFE (for accounts created via MetaMask browser wallet)
-    // funder: proxy wallet address where funds are held (visible in Polymarket profile)
-    const funderAddress = config.proxyWalletAddress;
-
-    if (!funderAddress) {
-      throw new Error('Missing POLYMARKET_PROXY_ADDRESS. Set it to your proxy wallet address from Polymarket profile.');
-    }
-
-    log.info({ funderAddress }, 'Using proxy wallet as funder');
-
+    // ClobClient constructor: (host, chainId, signer, creds, signatureType)
+    // signatureType: 0 = EOA (standard wallet signature)
+    // This worked in commit ed5aae96 - no funderAddress needed
     clobClient = new ClobClient(
       CLOB_HOST,
       config.chainId,
       signer,
       apiCreds,
-      2, // GNOSIS_SAFE signature type (MetaMask browser wallet)
-      funderAddress // Proxy wallet address
+      0 // EOA signature type
     );
 
     log.info('✅ Polymarket CLOB client initialized - REAL TRADING ENABLED');
@@ -298,8 +289,8 @@ async function executeOrder(
       'Executing CLOB order'
     );
 
-    // Get fee rate (0% for hourly markets)
-    const feeRateBps = Math.round((config.feeRates?.[config.marketTimeframe] ?? 0) * 10000);
+    // Fee rate in basis points - 0 for hourly markets (free trading)
+    const feeRateBps = 0;
 
     // Execute market order via CLOB
     const result = await client.createAndPostMarketOrder(
