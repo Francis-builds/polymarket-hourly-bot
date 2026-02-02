@@ -387,6 +387,7 @@ export function getCooldownRemaining(market: string): number {
 }
 
 // Simple position size calculation (for backwards compatibility)
+// IMPORTANT: maxPositionSize is the TOTAL cost (UP + DOWN combined), not per-side
 export function calculatePositionSize(opportunity: DipOpportunity): {
   sizeUp: number;
   sizeDown: number;
@@ -396,35 +397,36 @@ export function calculatePositionSize(opportunity: DipOpportunity): {
   const maxPositionSize = getMaxPositionSize();
 
   // Progressive sizing: risk% of current balance, capped by maxPositionSize
+  // This is the TOTAL budget for the trade (both sides combined)
   const riskBasedSize = currentBalance * riskPerTrade;
-  const positionSize = Math.min(riskBasedSize, maxPositionSize);
+  const totalBudget = Math.min(riskBasedSize, maxPositionSize);
+
+  // Calculate shares based on TOTAL cost (UP + DOWN)
+  // shares = totalBudget / (priceUp + priceDown)
+  const totalCostPerShare = opportunity.askUp + opportunity.askDown;
+  const maxSharesByBudget = totalBudget / totalCostPerShare;
+
+  // Limit by available liquidity on each side
+  const shares = Math.min(maxSharesByBudget, opportunity.liquidityUp, opportunity.liquidityDown);
+
+  const costUp = shares * opportunity.askUp;
+  const costDown = shares * opportunity.askDown;
+  const actualTotalCost = costUp + costDown;
 
   log.debug({
     balance: currentBalance.toFixed(2),
     riskPct: (riskPerTrade * 100).toFixed(0),
-    riskBasedSize: riskBasedSize.toFixed(2),
-    maxSize: maxPositionSize,
-    actualSize: positionSize.toFixed(2),
-  }, 'Position sizing');
-
-  // Calculate max shares we can buy with positionSize
-  const maxSharesUp = positionSize / opportunity.askUp;
-  const maxSharesDown = positionSize / opportunity.askDown;
-
-  // Limit by available liquidity
-  const sharesUp = Math.min(maxSharesUp, opportunity.liquidityUp);
-  const sharesDown = Math.min(maxSharesDown, opportunity.liquidityDown);
-
-  // We need same NUMBER of shares on each side (one side pays $1/share)
-  const shares = Math.min(sharesUp, sharesDown);
-
-  const costUp = shares * opportunity.askUp;
-  const costDown = shares * opportunity.askDown;
+    totalBudget: totalBudget.toFixed(2),
+    priceUp: opportunity.askUp.toFixed(3),
+    priceDown: opportunity.askDown.toFixed(3),
+    shares: shares.toFixed(2),
+    actualTotalCost: actualTotalCost.toFixed(2),
+  }, '📐 Position sizing');
 
   return {
     sizeUp: shares,
     sizeDown: shares,
-    totalCost: costUp + costDown,
+    totalCost: actualTotalCost,
   };
 }
 
@@ -440,33 +442,34 @@ export interface ExtendedSizingResult {
   reason?: string;
 }
 
-// Simple FAK (Fill and Kill) position sizing: 50-200 USDC range
+// Simple FAK (Fill and Kill) position sizing: 50-200 USDC TOTAL (both sides combined)
 // FAK fills as much as possible at best prices, cancels unfilled portion
 const MIN_TRADE_USDC = 50;
 const MAX_TRADE_USDC = 200;
 
-// Calculate position size with FAK logic (fill what's available, 50-200 USDC)
+// Calculate position size with FAK logic (fill what's available, 50-200 USDC TOTAL)
 export function calculatePositionSizeWithLiquidity(
   opportunity: DipOpportunity,
   orderbook: Orderbook
 ): ExtendedSizingResult {
-  // Calculate how many shares we can get for MAX_TRADE_USDC
-  const maxSharesUp = MAX_TRADE_USDC / opportunity.askUp;
-  const maxSharesDown = MAX_TRADE_USDC / opportunity.askDown;
-  const maxShares = Math.min(maxSharesUp, maxSharesDown);
+  // Total cost per share = priceUp + priceDown
+  const totalCostPerShare = opportunity.askUp + opportunity.askDown;
+
+  // Calculate max shares we can get with MAX_TRADE_USDC total budget
+  const maxSharesByBudget = MAX_TRADE_USDC / totalCostPerShare;
 
   // Analyze what we can actually fill
   const analysis = analyzeArbitrageLiquidity(
     orderbook.UP.asks,
     orderbook.DOWN.asks,
-    maxShares
+    maxSharesByBudget
   );
 
   // How many shares can we actually fill on both sides?
   const fillableShares = Math.min(analysis.up.availableSize, analysis.down.availableSize);
 
-  // Convert back to USDC value
-  const fillableUSDC = fillableShares * (opportunity.askUp + opportunity.askDown) / 2;
+  // Convert back to USDC value (total cost = shares × (priceUp + priceDown))
+  const fillableUSDC = fillableShares * totalCostPerShare;
 
   // FOK logic: use what's available between MIN and MAX
   let tradeShares = fillableShares;
@@ -478,8 +481,8 @@ export function calculatePositionSizeWithLiquidity(
     reason = `Insufficient liquidity ($${fillableUSDC.toFixed(0)} < $${MIN_TRADE_USDC} min)`;
     tradeShares = 0;
   } else if (fillableUSDC > MAX_TRADE_USDC) {
-    // Cap at max, recalculate shares
-    tradeShares = MAX_TRADE_USDC / ((opportunity.askUp + opportunity.askDown) / 2);
+    // Cap at max budget, recalculate shares
+    tradeShares = MAX_TRADE_USDC / totalCostPerShare;
   }
 
   // Calculate actual cost
