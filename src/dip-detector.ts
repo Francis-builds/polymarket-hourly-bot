@@ -113,7 +113,7 @@ export interface DetectionResult {
  * Logic:
  * 1. Is there a dip? (cost < threshold) → YES = TRADE
  * 2. Minimum $20 USDC, maximum $100 USDC
- * 3. FOK order handles the rest (fills what it can, kills the rest)
+ * 3. FAK order handles the rest (fills what it can, kills the rest)
  *
  * NO complex liquidity/slippage pre-checks - just try to trade!
  */
@@ -183,7 +183,7 @@ export function detectDip(orderbook: Orderbook): DetectionResult {
   const maxSharesDown = MAX_TRADE_USDC / bestAskDown.price;
   const targetShares = Math.min(maxSharesUp, maxSharesDown);
 
-  // Check available liquidity (just for info, we'll try anyway with FOK)
+  // Check available liquidity (just for info, we'll try anyway with FAK)
   const availableLiqUp = getTotalLiquidity(UP.asks);
   const availableLiqDown = getTotalLiquidity(DOWN.asks);
   const fillableShares = Math.min(targetShares, availableLiqUp, availableLiqDown);
@@ -399,14 +399,14 @@ export interface ExtendedSizingResult {
   reason?: string;
 }
 
-// Simplified position sizing - just return viable=true, let FOK handle it
+// Simplified position sizing - just return viable=true, let FAK handle it
 export function calculatePositionSizeWithLiquidity(
   opportunity: DipOpportunity,
   orderbook: Orderbook
 ): ExtendedSizingResult {
   const { sizeUp, sizeDown, totalCost } = calculatePositionSize(opportunity);
 
-  // Always viable - FOK will handle liquidity issues
+  // Always viable - FAK will handle liquidity issues
   return {
     sizeUp,
     sizeDown,
@@ -428,7 +428,7 @@ export function validateLiquidity(
   opportunity: DipOpportunity,
   requiredSize: number
 ): { valid: boolean; reason?: string } {
-  return { valid: true }; // Let FOK handle it
+  return { valid: true }; // Let FAK handle it
 }
 
 export function getActiveDips(): Array<{

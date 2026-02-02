@@ -137,19 +137,21 @@ export async function executeDipTrade(
   // Real trading mode - using CLOB client
 
   try {
-    // Execute both orders as FOK (Fill-or-Kill) to avoid partial fills
+    // Execute both orders as FAK (Fill-And-Kill) to capture partial fills
+    // FAK fills as much as possible at best available prices, cancels unfilled portion
     const [resultUp, resultDown] = await Promise.all([
-      executeOrder(tokenIdUp, 'BUY', sizeUp, 'FOK'),
-      executeOrder(tokenIdDown, 'BUY', sizeDown, 'FOK'),
+      executeOrder(tokenIdUp, 'BUY', sizeUp, 'FAK'),
+      executeOrder(tokenIdDown, 'BUY', sizeDown, 'FAK'),
     ]);
 
-    // Check if both orders succeeded
+    // Check if both orders succeeded (at least partially with FAK)
     if (!resultUp.success || !resultDown.success) {
       const error = resultUp.error ?? resultDown.error ?? 'Unknown error';
       log.warn({ resultUp, resultDown }, 'Trade partially or fully failed');
 
-      // TODO: If one succeeded and one failed, we may need to unwind
-      // For FOK orders, this shouldn't happen - both should fill or neither
+      // With FAK orders, partial fills are possible
+      // If one side filled and other didn't, we have an imbalanced position
+      // For now, we consider this a failure - the filled side will remain as a position
 
       return { success: false, error };
     }
@@ -286,7 +288,7 @@ async function executeOrder(
   tokenId: string,
   side: 'BUY' | 'SELL',
   amount: number,
-  orderType: 'FOK' | 'GTC'
+  orderType: 'FOK' | 'FAK' | 'GTC'
 ): Promise<TradeResult> {
   const client = getClobClient();
 
@@ -308,7 +310,7 @@ async function executeOrder(
         feeRateBps,
       },
       { negRisk: false, tickSize: '0.01' },
-      orderType === 'FOK' ? OrderType.FOK : OrderType.GTC
+      orderType === 'FOK' ? OrderType.FOK : orderType === 'FAK' ? OrderType.FAK : OrderType.GTC
     );
 
     // Check for errors - both errorMsg and HTTP error status codes
@@ -334,8 +336,8 @@ async function executeOrder(
     return {
       success: true,
       orderId: result.orderID ?? result.transactionHash,
-      filledSize: amount, // Market orders fill fully or fail
-      filledPrice: undefined, // Would need to query for actual fill price
+      filledSize: result.filledAmount ?? amount, // FAK may have partial fills
+      filledPrice: result.avgPrice ?? undefined, // Actual fill price if available
     };
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : String(error);

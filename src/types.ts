@@ -120,7 +120,7 @@ export interface TradeOrder {
   side: 'BUY' | 'SELL';
   price: number;
   size: number;
-  orderType: 'FOK' | 'GTC' | 'GTD';
+  orderType: 'FOK' | 'FAK' | 'GTC' | 'GTD';
 }
 
 export interface TradeResult {
