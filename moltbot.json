@@ -1,0 +1,17 @@
+{
+  "channels": {
+    "telegram": {
+      "enabled": true,
+      "dmPolicy": "allowlist",
+      "allowFrom": [1648556893, "@fr221232"]
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": "claude-sonnet-4-20250514",
+      "sandbox": {
+        "mode": "none"
+      }
+    }
+  }
+}

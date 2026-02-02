@@ -1,0 +1,34 @@
+{
+  "name": "polymarket-hourly-bot",
+  "version": "1.0.0",
+  "description": "Dip arbitrage bot for Polymarket hourly/4h/daily crypto markets (0% fees)",
+  "main": "dist/index.js",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "stats": "tsx src/stats-cli.ts"
+  },
+  "keywords": ["polymarket", "arbitrage", "trading", "bot"],
+  "author": "Fran",
+  "license": "MIT",
+  "dependencies": {
+    "@polymarket/clob-client": "^4.0.0",
+    "better-sqlite3": "^11.0.0",
+    "node-telegram-bot-api": "^0.66.0",
+    "dotenv": "^16.4.0",
+    "pino": "^9.0.0",
+    "pino-pretty": "^11.0.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.0",
+    "@types/node": "^22.0.0",
+    "@types/node-telegram-bot-api": "^0.64.0",
+    "@types/ws": "^8.5.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.4.0"
+  }
+}
