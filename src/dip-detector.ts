@@ -22,10 +22,13 @@ const MAX_TRADE_USDC = 100;
 
 /**
  * Calculate the REAL fee rate for 15m markets based on price
- * Formula: fee = 2 * (p * (1-p))^2
- * - At p=0.50: fee = 2 * 0.0625 = 0.125 → ~1.56% (max)
- * - At p=0.90: fee = 2 * 0.0081 = 0.0162 → ~0.16%
- * - At p=0.10: fee = 2 * 0.0081 = 0.0162 → ~0.16%
+ * Formula: fee = 2 * (p * (1-p))^3
+ * - At p=0.50: fee = 2 * 0.015625 = 0.03125 = ~3.12% (max)
+ * - At p=0.90: fee = 2 * 0.000729 = 0.00146 = ~0.15%
+ * - At p=0.10: fee = 2 * 0.000729 = 0.00146 = ~0.15%
+ *
+ * Source: Polymarket documentation confirms ~3.12% max fee at p=0.50
+ * (100 shares at $0.50 = $50 trade, fee = $1.56 = 3.12%)
  *
  * For 1h+ markets: fee = 0 (free)
  */
@@ -35,9 +38,9 @@ export function calculateRealFeeRate(price: number, timeframe: string): number {
     return 0;
   }
 
-  // 15m markets use the formula: 2 * (p * (1-p))^2
+  // 15m markets use the formula: 2 * (p * (1-p))^3
   const pq = price * (1 - price);
-  const feeRate = 2 * pq * pq;
+  const feeRate = 2 * pq * pq * pq;
 
   return feeRate;
 }
