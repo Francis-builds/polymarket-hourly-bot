@@ -10,6 +10,7 @@ import crypto from 'crypto';
 const log = createChildLogger('polymarket-api');
 
 const CLOB_API_URL = 'https://clob.polymarket.com';
+const DATA_API_URL = 'https://data-api.polymarket.com';
 
 // API credentials from environment
 const API_KEY = process.env.POLYMARKET_API_KEY || '';
@@ -31,6 +32,34 @@ interface WithdrawResponse {
   success: boolean;
   transactionHash?: string;
   error?: string;
+}
+
+// Position from Data API
+export interface PolymarketPosition {
+  asset: string;           // Token ID
+  market: string;          // Condition ID
+  outcome: string;         // "Yes" or "No"
+  outcomeIndex: number;    // 0 or 1
+  size: number;            // Number of shares
+  avgPrice: number;        // Average entry price
+  currentPrice: number;    // Current market price
+  currentValue: number;    // size * currentPrice
+  pnl: number;             // Unrealized P&L
+  pnlPercent: number;      // P&L as percentage
+  marketSlug?: string;     // Market slug for display
+  question?: string;       // Market question
+  resolved?: boolean;      // Is market resolved
+  redeemable?: boolean;    // Has unclaimed proceeds
+}
+
+// Full portfolio summary
+export interface PortfolioSummary {
+  cashAvailable: number;       // USDC available for trading
+  positionsValue: number;      // Total value of open positions
+  unrealizedPnl: number;       // Total unrealized P&L
+  unclaimedProceeds: number;   // Proceeds from resolved markets
+  totalPortfolio: number;      // cash + positions + unclaimed
+  positions: PolymarketPosition[];
 }
 
 // Generate signature for authenticated requests
@@ -223,4 +252,132 @@ export function getApiStatus(): { hasKey: boolean; hasSecret: boolean; hasPassph
     hasSecret: !!API_SECRET,
     hasPassphrase: !!API_PASSPHRASE,
   };
+}
+
+// Data API response types
+interface DataApiPosition {
+  proxyWallet: string;
+  asset: string;
+  conditionId: string;
+  size: string;
+  avgPrice: string;
+  cashBalance: string;
+  currentValue: string;
+  pnl: string;
+  realizedPnl: string;
+  curPrice: string;
+  outcome: string;
+  outcomeIndex: string;
+  redeemable: string;
+  mergeable: string;
+  market?: {
+    slug?: string;
+    question?: string;
+    resolved?: boolean;
+  };
+}
+
+/**
+ * Get all positions from Data API
+ */
+export async function getPositions(): Promise<PolymarketPosition[]> {
+  const address = process.env.POLYMARKET_ADDRESS;
+  if (!address) {
+    log.warn('No POLYMARKET_ADDRESS configured');
+    return [];
+  }
+
+  try {
+    const url = `${DATA_API_URL}/positions?user=${address.toLowerCase()}`;
+    log.debug({ url }, 'Fetching positions from Data API');
+
+    const response = await fetch(url);
+    if (!response.ok) {
+      log.error({ status: response.status }, 'Data API positions error');
+      return [];
+    }
+
+    const data = await response.json() as DataApiPosition[];
+
+    if (!Array.isArray(data)) {
+      log.warn({ data }, 'Unexpected positions response format');
+      return [];
+    }
+
+    const positions: PolymarketPosition[] = data.map(p => ({
+      asset: p.asset,
+      market: p.conditionId,
+      outcome: p.outcome || (p.outcomeIndex === '0' ? 'Yes' : 'No'),
+      outcomeIndex: parseInt(p.outcomeIndex) || 0,
+      size: parseFloat(p.size) || 0,
+      avgPrice: parseFloat(p.avgPrice) || 0,
+      currentPrice: parseFloat(p.curPrice) || 0,
+      currentValue: parseFloat(p.currentValue) || 0,
+      pnl: parseFloat(p.pnl) || 0,
+      pnlPercent: parseFloat(p.avgPrice) > 0
+        ? ((parseFloat(p.curPrice) - parseFloat(p.avgPrice)) / parseFloat(p.avgPrice)) * 100
+        : 0,
+      marketSlug: p.market?.slug,
+      question: p.market?.question,
+      resolved: p.market?.resolved ?? false,
+      redeemable: parseFloat(p.redeemable) > 0,
+    }));
+
+    log.info({ count: positions.length }, 'Positions fetched from Data API');
+    return positions;
+  } catch (error) {
+    log.error({ error }, 'Failed to fetch positions');
+    return [];
+  }
+}
+
+/**
+ * Get full portfolio summary
+ */
+export async function getPortfolio(): Promise<PortfolioSummary | null> {
+  const address = process.env.POLYMARKET_ADDRESS;
+  if (!address) {
+    log.warn('No POLYMARKET_ADDRESS configured');
+    return null;
+  }
+
+  try {
+    // Fetch positions and cash balance in parallel
+    const [positions, cashBalance] = await Promise.all([
+      getPositions(),
+      getPolymarketBalance(),
+    ]);
+
+    // Calculate portfolio metrics
+    const openPositions = positions.filter(p => !p.resolved && p.size > 0);
+    const redeemablePositions = positions.filter(p => p.redeemable);
+
+    const positionsValue = openPositions.reduce((sum, p) => sum + p.currentValue, 0);
+    const unrealizedPnl = openPositions.reduce((sum, p) => sum + p.pnl, 0);
+    const unclaimedProceeds = redeemablePositions.reduce((sum, p) => sum + p.currentValue, 0);
+
+    const cash = cashBalance ?? 0;
+    const totalPortfolio = cash + positionsValue + unclaimedProceeds;
+
+    const summary: PortfolioSummary = {
+      cashAvailable: cash,
+      positionsValue,
+      unrealizedPnl,
+      unclaimedProceeds,
+      totalPortfolio,
+      positions: openPositions,
+    };
+
+    log.info({
+      cash: cash.toFixed(2),
+      positions: positionsValue.toFixed(2),
+      unclaimed: unclaimedProceeds.toFixed(2),
+      total: totalPortfolio.toFixed(2),
+    }, '📊 Portfolio summary');
+
+    return summary;
+  } catch (error) {
+    log.error({ error }, 'Failed to get portfolio');
+    return null;
+  }
 }

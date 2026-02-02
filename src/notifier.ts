@@ -13,7 +13,7 @@ import { getStrategyBStats, getActiveCycles } from './strategy-b.js';
 import { getTimingStats } from './timing.js';
 import { getCurrentBalance } from './dip-detector.js';
 import { getLastKnownBalance } from './wallet-monitor.js';
-import { getPolymarketBalance, withdrawFromPolymarket, isPolymarketApiConfigured, getApiStatus } from './polymarket-api.js';
+import { getPolymarketBalance, getPortfolio, withdrawFromPolymarket, isPolymarketApiConfigured, getApiStatus, type PortfolioSummary } from './polymarket-api.js';
 import type { DipOpportunity, Position, BotStats } from './types.js';
 
 // Cached Polymarket balance (updated periodically)
@@ -77,6 +77,8 @@ function setupCommands(): void {
   bot.onText(/\/golive/, handleGoLiveCommand);
   bot.onText(/\/gopaper/, handleGoPaperCommand);
   bot.onText(/\/wallet/, handleWalletCommand);
+  bot.onText(/\/portfolio/, handlePortfolioCommand);
+  bot.onText(/\/claim/, handleClaimCommand);
   bot.onText(/\/withdraw(?:\s+(\d+(?:\.\d+)?))?/, handleWithdrawCommand);
   bot.onText(/\/threshold(?:\s+(\d+(?:\.\d+)?))?/, handleThresholdCommand);
   bot.onText(/\/maxposition(?:\s+(\d+(?:\.\d+)?))?/, handleMaxPositionCommand);
@@ -397,38 +399,129 @@ async function getCachedPolymarketBalance(): Promise<number | null> {
 async function handleWalletCommand(msg: TelegramBot.Message): Promise<void> {
   if (msg.chat.id.toString() !== config.telegram.chatId) return;
 
+  await bot?.sendMessage(msg.chat.id, '⏳ Consultando portfolio...', { parse_mode: 'HTML' });
+
   const walletBalance = getLastKnownBalance();
-  const polymarketBalance = await getCachedPolymarketBalance();
+  const portfolio = await getPortfolio();
   const address = process.env.POLYMARKET_ADDRESS || 'No configurado';
   const mode = isLiveTrading ? '🔴 LIVE' : '📝 PAPER';
 
-  const apiStatus = getApiStatus();
-  const apiConfigured = apiStatus.hasKey && apiStatus.hasSecret && apiStatus.hasPassphrase;
+  let text = `💼 <b>PORTFOLIO</b>\n\n`;
 
-  let balanceText = '';
-  if (polymarketBalance !== null) {
-    balanceText = `💰 <b>Polymarket:</b> $${polymarketBalance.toFixed(2)} USDC`;
-  } else if (!apiConfigured) {
-    balanceText = `💰 <b>Polymarket:</b> ⚠️ API no configurada`;
+  if (portfolio) {
+    const pnlEmoji = portfolio.unrealizedPnl >= 0 ? '📈' : '📉';
+
+    text += `<code>┌──────────────────────────────┐\n`;
+    text += `│ 💵 Cash disponible │ $${portfolio.cashAvailable.toFixed(2).padStart(8)} │\n`;
+    text += `│ 📊 Posiciones      │ $${portfolio.positionsValue.toFixed(2).padStart(8)} │\n`;
+    if (portfolio.unclaimedProceeds > 0) {
+      text += `│ 🎁 Sin reclamar   │ $${portfolio.unclaimedProceeds.toFixed(2).padStart(8)} │\n`;
+    }
+    text += `├──────────────────────────────┤\n`;
+    text += `│ 💰 <b>POLYMARKET</b>    │ $${portfolio.totalPortfolio.toFixed(2).padStart(8)} │\n`;
+    text += `│ 💼 Wallet Polygon  │ $${(walletBalance ?? 0).toFixed(2).padStart(8)} │\n`;
+    text += `├──────────────────────────────┤\n`;
+    const grandTotal = portfolio.totalPortfolio + (walletBalance ?? 0);
+    text += `│ 🏦 <b>TOTAL</b>          │ $${grandTotal.toFixed(2).padStart(8)} │\n`;
+    text += `└──────────────────────────────┘</code>\n\n`;
+
+    if (portfolio.unrealizedPnl !== 0) {
+      text += `${pnlEmoji} PnL no realizado: $${portfolio.unrealizedPnl.toFixed(2)}\n`;
+    }
+
+    if (portfolio.positions.length > 0) {
+      text += `\n📊 <b>${portfolio.positions.length} posiciones abiertas</b>\n`;
+      text += `/portfolio para detalle\n`;
+    }
+
+    if (portfolio.unclaimedProceeds > 0) {
+      text += `\n🎁 <b>Hay $${portfolio.unclaimedProceeds.toFixed(2)} sin reclamar!</b>\n`;
+      text += `/claim para reclamar\n`;
+    }
   } else {
-    balanceText = `💰 <b>Polymarket:</b> Error consultando`;
+    text += `⚠️ Error consultando portfolio\n`;
+    text += `💼 <b>Wallet:</b> $${walletBalance?.toFixed(2) ?? '0.00'} USDC\n`;
   }
 
-  balanceText += `\n💼 <b>Wallet:</b> $${walletBalance?.toFixed(2) ?? '0.00'} USDC`;
+  text += `\n📍 <code>${address}</code>\n`;
+  text += `🎮 Modo: ${mode}`;
 
-  const totalBalance = (polymarketBalance ?? 0) + (walletBalance ?? 0);
+  await bot?.sendMessage(msg.chat.id, text, { parse_mode: 'HTML' });
+}
 
+async function handlePortfolioCommand(msg: TelegramBot.Message): Promise<void> {
+  if (msg.chat.id.toString() !== config.telegram.chatId) return;
+
+  await bot?.sendMessage(msg.chat.id, '⏳ Consultando posiciones...', { parse_mode: 'HTML' });
+
+  const portfolio = await getPortfolio();
+
+  if (!portfolio) {
+    await bot?.sendMessage(msg.chat.id, '⚠️ Error consultando portfolio', { parse_mode: 'HTML' });
+    return;
+  }
+
+  let text = `📊 <b>POSICIONES ABIERTAS</b>\n\n`;
+
+  if (portfolio.positions.length === 0) {
+    text += `No hay posiciones abiertas.\n`;
+    text += `\n💵 Cash disponible: $${portfolio.cashAvailable.toFixed(2)}`;
+  } else {
+    for (const pos of portfolio.positions.slice(0, 10)) {
+      const pnlEmoji = pos.pnl >= 0 ? '🟢' : '🔴';
+      const shortQuestion = pos.question?.slice(0, 30) || pos.market.slice(0, 10);
+
+      text += `${pnlEmoji} <b>${shortQuestion}...</b>\n`;
+      text += `   ${pos.outcome}: ${pos.size.toFixed(0)} @ $${pos.avgPrice.toFixed(3)}\n`;
+      text += `   Valor: $${pos.currentValue.toFixed(2)} (${pos.pnl >= 0 ? '+' : ''}$${pos.pnl.toFixed(2)})\n\n`;
+    }
+
+    if (portfolio.positions.length > 10) {
+      text += `<i>... y ${portfolio.positions.length - 10} posiciones más</i>\n\n`;
+    }
+
+    text += `━━━━━━━━━━━━━━━━━━\n`;
+    text += `💵 Cash: $${portfolio.cashAvailable.toFixed(2)}\n`;
+    text += `📊 Posiciones: $${portfolio.positionsValue.toFixed(2)}\n`;
+    text += `💰 Total: $${portfolio.totalPortfolio.toFixed(2)}`;
+  }
+
+  await bot?.sendMessage(msg.chat.id, text, { parse_mode: 'HTML' });
+}
+
+async function handleClaimCommand(msg: TelegramBot.Message): Promise<void> {
+  if (msg.chat.id.toString() !== config.telegram.chatId) return;
+
+  await bot?.sendMessage(msg.chat.id, '⏳ Buscando proceeds sin reclamar...', { parse_mode: 'HTML' });
+
+  const portfolio = await getPortfolio();
+
+  if (!portfolio) {
+    await bot?.sendMessage(msg.chat.id, '⚠️ Error consultando portfolio', { parse_mode: 'HTML' });
+    return;
+  }
+
+  if (portfolio.unclaimedProceeds <= 0) {
+    await bot?.sendMessage(
+      msg.chat.id,
+      `✅ No hay proceeds sin reclamar.\n\n💵 Cash disponible: $${portfolio.cashAvailable.toFixed(2)}`,
+      { parse_mode: 'HTML' }
+    );
+    return;
+  }
+
+  // TODO: Implementar claim automático via API
+  // Por ahora mostramos instrucciones manuales
   await bot?.sendMessage(
     msg.chat.id,
-    `💼 <b>BALANCE INFO</b>\n\n` +
-    `${balanceText}\n` +
-    `━━━━━━━━━━━━━━━━━━\n` +
-    `📊 <b>Total:</b> $${totalBalance.toFixed(2)} USDC\n\n` +
-    `📍 Wallet address:\n<code>${address}</code>\n\n` +
-    `🎮 Modo: ${mode}\n\n` +
-    `<b>Comandos:</b>\n` +
-    `/withdraw 100 - Retirar $100 a wallet\n` +
-    `/golive - Activar trading real`,
+    `🎁 <b>PROCEEDS SIN RECLAMAR</b>\n\n` +
+    `Monto: <b>$${portfolio.unclaimedProceeds.toFixed(2)}</b>\n\n` +
+    `⚠️ <b>Claim automático no disponible aún.</b>\n\n` +
+    `Para reclamar manualmente:\n` +
+    `1. Ve a polymarket.com/portfolio\n` +
+    `2. Click en "Claim" en las posiciones resueltas\n\n` +
+    `<i>El claim automático requiere firmar transacciones on-chain, ` +
+    `lo cual aún no está implementado en el bot.</i>`,
     { parse_mode: 'HTML' }
   );
 }
