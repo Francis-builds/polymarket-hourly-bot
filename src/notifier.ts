@@ -546,7 +546,7 @@ async function handleThresholdCommand(msg: TelegramBot.Message, match: RegExpExe
     `✅ <b>Threshold actualizado</b>\n\n` +
     `Anterior: ${oldValue}\n` +
     `Nuevo: <b>${value}</b>\n\n` +
-    `Los trades se ejecutarán cuando total < ${value}`,
+    `Los trades se ejecutarán cuando total &lt; ${value}`,
     { parse_mode: 'HTML' }
   );
 }
