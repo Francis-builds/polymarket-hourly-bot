@@ -156,9 +156,13 @@ export async function executeDipTrade(
   // Real trading mode - using CLOB client
   const orderStart = performance.now();
 
-  // Calculate limit prices with 2¢ buffer for price protection
-  const limitPriceUp = opportunity.askUp + 0.02;
-  const limitPriceDown = opportunity.askDown + 0.02;
+  // Round sizes to 2 decimal places (CLOB requirement)
+  const roundedSizeUp = Math.floor(sizeUp * 100) / 100;
+  const roundedSizeDown = Math.floor(sizeDown * 100) / 100;
+
+  // Calculate limit prices with 2¢ buffer for price protection (rounded to 2 decimals)
+  const limitPriceUp = Math.round((opportunity.askUp + 0.02) * 100) / 100;
+  const limitPriceDown = Math.round((opportunity.askDown + 0.02) * 100) / 100;
 
   // Verify total cost is within maxTotalCost limit
   const maxCost = getMaxTotalCost();
@@ -174,8 +178,8 @@ export async function executeDipTrade(
     // Execute both orders as FAK (Fill-And-Kill) with limit prices for protection
     // FAK fills as much as possible at or below limit price, cancels unfilled portion
     const [resultUp, resultDown] = await Promise.all([
-      executeOrder(tokenIdUp, 'BUY', sizeUp, 'FAK', limitPriceUp, opportunity.market, 'UP'),
-      executeOrder(tokenIdDown, 'BUY', sizeDown, 'FAK', limitPriceDown, opportunity.market, 'DOWN'),
+      executeOrder(tokenIdUp, 'BUY', roundedSizeUp, 'FAK', limitPriceUp, opportunity.market, 'UP'),
+      executeOrder(tokenIdDown, 'BUY', roundedSizeDown, 'FAK', limitPriceDown, opportunity.market, 'DOWN'),
     ]);
 
     const orderEnd = performance.now();
