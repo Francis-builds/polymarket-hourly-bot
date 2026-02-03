@@ -66,15 +66,36 @@ export async function initExecutor(): Promise<void> {
       passphrase: config.clobApi.passphrase,
     };
 
-    // ClobClient constructor: (host, chainId, signer, creds, signatureType)
-    // signatureType: 0 = EOA (standard wallet signature)
-    // This worked in commit ed5aae96 - no funderAddress needed
+    // ClobClient constructor: (host, chainId, signer, creds, signatureType, funder)
+    //
+    // signatureType values (configurable via POLYMARKET_SIGNATURE_TYPE):
+    //   0 = EOA (standalone wallet, funds in same address as signer)
+    //   1 = POLY_PROXY (Magic Link / email login)
+    //   2 = GNOSIS_SAFE (MetaMask via Polymarket.com - proxy wallet holds funds)
+    const signatureType = config.signatureType;
+    const funderAddress = config.proxyWalletAddress;
+
+    // Validate funder address requirement for non-EOA signature types
+    if (signatureType !== 0 && !funderAddress) {
+      throw new Error(
+        `Missing POLYMARKET_PROXY_ADDRESS. Required for signatureType=${signatureType}. ` +
+        'Set it to your proxy wallet address from Polymarket profile.'
+      );
+    }
+
+    const signatureTypeNames = ['EOA', 'POLY_PROXY', 'GNOSIS_SAFE'];
+    log.info(
+      { walletAddress, funderAddress, signatureType, signatureTypeName: signatureTypeNames[signatureType] },
+      `Initializing CLOB client (${signatureTypeNames[signatureType]} mode)`
+    );
+
     clobClient = new ClobClient(
       CLOB_HOST,
       config.chainId,
       signer,
       apiCreds,
-      0 // EOA signature type
+      signatureType,
+      signatureType !== 0 ? funderAddress : undefined
     );
 
     log.info('✅ Polymarket CLOB client initialized - REAL TRADING ENABLED');
@@ -126,6 +147,7 @@ export async function executeDipTrade(
   }
 
   // Real trading mode - using CLOB client
+  const orderStart = performance.now();
 
   try {
     // Execute both orders as FAK (Fill-And-Kill) to capture partial fills
@@ -135,14 +157,32 @@ export async function executeDipTrade(
       executeOrder(tokenIdDown, 'BUY', sizeDown, 'FAK'),
     ]);
 
+    const orderEnd = performance.now();
+    const orderExecutionMs = orderEnd - orderStart;
+    const detectionToStartMs = opportunity.detectedAt ? orderStart - opportunity.detectedAt : undefined;
+    const totalLatencyMs = opportunity.detectedAt ? orderEnd - opportunity.detectedAt : orderExecutionMs;
+
+    // Log latency metrics
+    log.info(
+      {
+        detectionToStartMs: detectionToStartMs?.toFixed(1),
+        orderExecutionMs: orderExecutionMs.toFixed(1),
+        totalLatencyMs: totalLatencyMs.toFixed(1),
+      },
+      '⏱️ Trade latency metrics'
+    );
+
     // Check if both orders succeeded (at least partially with FAK)
     if (!resultUp.success || !resultDown.success) {
       const error = resultUp.error ?? resultDown.error ?? 'Unknown error';
       log.warn({ resultUp, resultDown }, 'Trade partially or fully failed');
 
-      // With FAK orders, partial fills are possible
-      // If one side filled and other didn't, we have an imbalanced position
-      // For now, we consider this a failure - the filled side will remain as a position
+      // ROLLBACK: If one side succeeded and the other failed, sell the successful side
+      if (resultUp.success && !resultDown.success && resultUp.filledSize) {
+        await rollbackPosition(tokenIdUp, resultUp.filledSize, 'SELL', 'UP failed, rolling back DOWN');
+      } else if (resultDown.success && !resultUp.success && resultDown.filledSize) {
+        await rollbackPosition(tokenIdDown, resultDown.filledSize, 'SELL', 'DOWN failed, rolling back UP');
+      }
 
       return { success: false, error };
     }
@@ -174,11 +214,12 @@ export async function executeDipTrade(
         positionId,
         totalCost: totalCost.toFixed(2),
         expectedProfit: position.expectedProfit?.toFixed(2),
+        latencyMs: totalLatencyMs.toFixed(1),
       },
       '✅ Trade executed successfully'
     );
 
-    return { success: true, position };
+    return { success: true, position, latencyMs: totalLatencyMs };
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : String(error);
     log.error({ error }, 'Trade execution failed');
@@ -362,6 +403,30 @@ function generatePositionId(): string {
   const timestamp = Date.now().toString(36);
   const random = Math.random().toString(36).substring(2, 8);
   return `pos_${timestamp}_${random}`;
+}
+
+// Rollback a position by selling the filled side
+async function rollbackPosition(
+  tokenId: string,
+  size: number,
+  side: 'BUY' | 'SELL',
+  reason: string
+): Promise<void> {
+  log.warn({ tokenId: tokenId.substring(0, 16) + '...', size, side, reason }, '🔄 Attempting rollback');
+
+  try {
+    const result = await executeOrder(tokenId, side, size, 'FAK');
+    if (result.success) {
+      log.info(
+        { filledSize: result.filledSize, filledPrice: result.filledPrice },
+        '✅ Rollback successful'
+      );
+    } else {
+      log.error({ error: result.error }, '❌ Rollback failed - manual intervention may be needed');
+    }
+  } catch (error) {
+    log.error({ error }, '❌ Rollback exception - manual intervention may be needed');
+  }
 }
 
 // Check if we can execute (CLOB client is ready or paper mode)

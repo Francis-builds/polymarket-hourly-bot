@@ -1,12 +1,15 @@
 services:
-  polymarket-hourly-bot:
+  polymarket-1h-bot:
     build: .
-    container_name: polymarket-hourly-bot
+    container_name: polymarket-1h-bot
     restart: unless-stopped
     env_file:
       - .env
     volumes:
-      - ./data:/app/data
+      - ./data-1h:/app/data
+      - ./logs-1h:/app/logs
+    environment:
+      - LOGS_DIR=/app/logs
     logging:
       driver: "json-file"
       options:

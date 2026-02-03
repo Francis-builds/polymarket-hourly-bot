@@ -38,6 +38,12 @@ export const config = {
   // Polymarket proxy wallet address (for accounts created via Polymarket.com)
   proxyWalletAddress: optionalEnv('POLYMARKET_PROXY_ADDRESS', ''),
 
+  // Signature type for CLOB authentication
+  // 0 = EOA (standalone wallet, funds in signer address)
+  // 1 = POLY_PROXY (Magic Link / email login)
+  // 2 = GNOSIS_SAFE (MetaMask via Polymarket.com - proxy wallet holds funds)
+  signatureType: parseInt(optionalEnv('POLYMARKET_SIGNATURE_TYPE', '2'), 10) as 0 | 1 | 2,
+
   // Telegram (optional in paper mode - logs to console)
   telegram: {
     botToken: optionalEnv('TELEGRAM_BOT_TOKEN', ''),
