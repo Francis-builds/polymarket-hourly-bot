@@ -1,6 +1,7 @@
 import WebSocket from 'ws';
 import { config } from './config.js';
 import { createChildLogger } from './logger.js';
+import { markMarketHot } from './order-presigner.js';
 import type { Orderbook, OrderbookLevel } from './types.js';
 
 const log = createChildLogger('market-data');
@@ -1055,17 +1056,24 @@ function handlePriceChange(change: Record<string, unknown>): void {
   orderbookCache.set(mapKey, orderbook);
 
   // Log occasionally (every 5000 updates = ~50 seconds)
+  const upAsk = orderbook.UP.asks[0]?.price ?? 0;
+  const downAsk = orderbook.DOWN.asks[0]?.price ?? 0;
+  const totalCost = upAsk + downAsk;
+
   if (updateCount % 5000 === 0) {
-    const upAsk = orderbook.UP.asks[0]?.price ?? 0;
-    const downAsk = orderbook.DOWN.asks[0]?.price ?? 0;
     log.info({
       symbol,
       window: windowLabel,
       upAsk: upAsk.toFixed(3),
       downAsk: downAsk.toFixed(3),
-      total: (upAsk + downAsk).toFixed(3),
+      total: totalCost.toFixed(3),
       updateCount,
     }, '📈 Price update');
+  }
+
+  // Mark market as "hot" if approaching threshold (for order pre-signing)
+  if (upAsk > 0 && downAsk > 0) {
+    markMarketHot(symbol, totalCost);
   }
 
   // Notify callbacks for dip detection

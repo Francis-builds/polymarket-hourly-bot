@@ -33,9 +33,11 @@ import {
   getThreshold,
   getMaxPositionSize,
   getMaxOpenPositions,
+  getMaxTotalCost,
   setThreshold,
   setMaxPositionSize,
   setMaxOpenPositions,
+  setMaxTotalCost,
   getRuntimeConfig,
 } from './runtime-config.js';
 
@@ -83,6 +85,7 @@ function setupCommands(): void {
   bot.onText(/\/threshold(?:\s+(\d+(?:\.\d+)?))?/, handleThresholdCommand);
   bot.onText(/\/maxposition(?:\s+(\d+(?:\.\d+)?))?/, handleMaxPositionCommand);
   bot.onText(/\/maxopen(?:\s+(\d+))?/, handleMaxOpenCommand);
+  bot.onText(/\/maxcost(?:\s+(\d+(?:\.\d+)?))?/, handleMaxCostCommand);
   bot.onText(/\/config/, handleConfigCommand);
   bot.onText(/\/help/, handleHelpCommand);
 
@@ -716,6 +719,46 @@ async function handleMaxOpenCommand(msg: TelegramBot.Message, match: RegExpExecA
   );
 }
 
+async function handleMaxCostCommand(msg: TelegramBot.Message, match: RegExpExecArray | null): Promise<void> {
+  if (msg.chat.id.toString() !== config.telegram.chatId) return;
+
+  const valueStr = match?.[1];
+
+  if (!valueStr) {
+    await bot?.sendMessage(
+      msg.chat.id,
+      `🛡️ <b>MAX TOTAL COST</b>\n\n` +
+      `Actual: <b>${getMaxTotalCost()}</b>\n\n` +
+      `Uso: /maxcost 0.92\n` +
+      `Rango válido: 0.80 - 0.99\n\n` +
+      `Este valor es el máximo costo UP+DOWN que se acepta para un trade.\n` +
+      `Protege contra slippage excesivo.`,
+      { parse_mode: 'HTML' }
+    );
+    return;
+  }
+
+  const value = parseFloat(valueStr);
+  if (isNaN(value) || value < 0.80 || value > 0.99) {
+    await bot?.sendMessage(msg.chat.id, '❌ Max cost inválido. Rango: 0.80 - 0.99');
+    return;
+  }
+
+  const oldValue = getMaxTotalCost();
+  setMaxTotalCost(value);
+
+  log.info({ oldMaxCost: oldValue, newMaxCost: value }, 'Max total cost updated via Telegram');
+
+  await bot?.sendMessage(
+    msg.chat.id,
+    `✅ <b>Max Total Cost actualizado</b>\n\n` +
+    `Anterior: ${oldValue}\n` +
+    `Nuevo: <b>${value}</b>\n\n` +
+    `Solo se ejecutarán trades con UP+DOWN ≤ ${value}`,
+    { parse_mode: 'HTML' }
+  );
+}
+
 async function handleConfigCommand(msg: TelegramBot.Message): Promise<void> {
   if (msg.chat.id.toString() !== config.telegram.chatId) return;
 
@@ -726,10 +769,12 @@ async function handleConfigCommand(msg: TelegramBot.Message): Promise<void> {
     `⚙️ <b>CONFIGURACIÓN ACTUAL</b>\n\n` +
     `🎮 Modo: ${mode}\n` +
     `📉 Threshold: <b>${getThreshold()}</b>\n` +
+    `🛡️ Max Cost: <b>${getMaxTotalCost()}</b>\n` +
     `💰 Max Position: <b>$${getMaxPositionSize()}</b>\n` +
     `📊 Max Open: <b>${getMaxOpenPositions()}</b>\n\n` +
     `<b>Comandos:</b>\n` +
     `/threshold 0.95 - Cambiar threshold\n` +
+    `/maxcost 0.92 - Cambiar max cost (slippage protection)\n` +
     `/maxposition 200 - Cambiar max position\n` +
     `/maxopen 5 - Cambiar max open`,
     { parse_mode: 'HTML' }
@@ -759,6 +804,7 @@ async function handleHelpCommand(msg: TelegramBot.Message): Promise<void> {
 <b>⚙️ Config:</b>
 /config - Ver configuración actual
 /threshold X - Cambiar threshold (ej: 0.95)
+/maxcost X - Cambiar max cost (ej: 0.92)
 /maxposition X - Cambiar max position (ej: 200)
 /maxopen X - Cambiar max open (ej: 5)
 
@@ -768,7 +814,7 @@ async function handleHelpCommand(msg: TelegramBot.Message): Promise<void> {
 /help - Este mensaje
 
 <b>Actual:</b>
-Threshold: ${getThreshold()} | Max: $${getMaxPositionSize()} | Open: ${getMaxOpenPositions()}
+Threshold: ${getThreshold()} | MaxCost: ${getMaxTotalCost()} | Max: $${getMaxPositionSize()} | Open: ${getMaxOpenPositions()}
   `.trim();
 
   await bot?.sendMessage(msg.chat.id, text, { parse_mode: 'HTML' });

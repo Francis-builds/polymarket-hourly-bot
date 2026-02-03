@@ -13,6 +13,7 @@ let threshold = config.trading.threshold;
 let maxPositionSize = config.trading.maxPositionSize;
 let maxOpenPositions = config.trading.maxOpenPositions;
 let marketTimeframe: '1h' | '4h' | 'daily' = config.marketTimeframe as '1h' | '4h' | 'daily';
+let maxTotalCost = 0.92; // Max UP+DOWN cost to accept (slippage protection)
 
 // Getters
 export function getThreshold(): number {
@@ -25,6 +26,10 @@ export function getMaxPositionSize(): number {
 
 export function getMaxOpenPositions(): number {
   return maxOpenPositions;
+}
+
+export function getMaxTotalCost(): number {
+  return maxTotalCost;
 }
 
 // Setters
@@ -41,6 +46,11 @@ export function setMaxPositionSize(value: number): void {
 export function setMaxOpenPositions(value: number): void {
   log.info({ oldValue: maxOpenPositions, newValue: value }, 'Max open positions updated');
   maxOpenPositions = value;
+}
+
+export function setMaxTotalCost(value: number): void {
+  log.info({ oldValue: maxTotalCost, newValue: value }, 'Max total cost updated');
+  maxTotalCost = value;
 }
 
 // Timeframe getters/setters
@@ -64,6 +74,6 @@ export function getCurrentFeeRate(): number {
 }
 
 // Get all current config
-export function getRuntimeConfig(): { threshold: number; maxPositionSize: number; maxOpenPositions: number; timeframe: string; feeRate: number } {
-  return { threshold, maxPositionSize, maxOpenPositions, timeframe: marketTimeframe, feeRate: getCurrentFeeRate() };
+export function getRuntimeConfig(): { threshold: number; maxPositionSize: number; maxOpenPositions: number; timeframe: string; feeRate: number; maxTotalCost: number } {
+  return { threshold, maxPositionSize, maxOpenPositions, timeframe: marketTimeframe, feeRate: getCurrentFeeRate(), maxTotalCost };
 }

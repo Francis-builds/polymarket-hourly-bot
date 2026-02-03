@@ -1,6 +1,8 @@
 import { config } from './config.js';
 import { createChildLogger } from './logger.js';
 import { isLiveTradingEnabled } from './notifier.js';
+import { getMaxTotalCost } from './runtime-config.js';
+import { initPresigner, stopPresigner, getPresignedOrder, postPresignedOrder } from './order-presigner.js';
 import type { DipOpportunity, Position, TradeResult } from './types.js';
 
 const log = createChildLogger('executor');
@@ -100,11 +102,16 @@ export async function initExecutor(): Promise<void> {
 
     log.info('✅ Polymarket CLOB client initialized - REAL TRADING ENABLED');
 
+    // Initialize order pre-signer for reduced latency
+    initPresigner(clobClient, Side);
+
   } catch (error) {
     log.error({ error }, 'Failed to initialize Polymarket CLOB client');
     throw error;
   }
 }
+
+export { stopPresigner };
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export function getClobClient(): any {
@@ -149,12 +156,26 @@ export async function executeDipTrade(
   // Real trading mode - using CLOB client
   const orderStart = performance.now();
 
+  // Calculate limit prices with 2¢ buffer for price protection
+  const limitPriceUp = opportunity.askUp + 0.02;
+  const limitPriceDown = opportunity.askDown + 0.02;
+
+  // Verify total cost is within maxTotalCost limit
+  const maxCost = getMaxTotalCost();
+  if (opportunity.totalCost > maxCost) {
+    log.warn({
+      totalCost: opportunity.totalCost.toFixed(3),
+      maxCost: maxCost.toFixed(3),
+    }, '❌ Trade rejected: total cost exceeds maxTotalCost');
+    return { success: false, error: `Total cost ${opportunity.totalCost.toFixed(3)} > max ${maxCost}` };
+  }
+
   try {
-    // Execute both orders as FAK (Fill-And-Kill) to capture partial fills
-    // FAK fills as much as possible at best available prices, cancels unfilled portion
+    // Execute both orders as FAK (Fill-And-Kill) with limit prices for protection
+    // FAK fills as much as possible at or below limit price, cancels unfilled portion
     const [resultUp, resultDown] = await Promise.all([
-      executeOrder(tokenIdUp, 'BUY', sizeUp, 'FAK'),
-      executeOrder(tokenIdDown, 'BUY', sizeDown, 'FAK'),
+      executeOrder(tokenIdUp, 'BUY', sizeUp, 'FAK', limitPriceUp, opportunity.market, 'UP'),
+      executeOrder(tokenIdDown, 'BUY', sizeDown, 'FAK', limitPriceDown, opportunity.market, 'DOWN'),
     ]);
 
     const orderEnd = performance.now();
@@ -320,30 +341,66 @@ async function executeOrder(
   tokenId: string,
   side: 'BUY' | 'SELL',
   amount: number,
-  orderType: 'FOK' | 'FAK' | 'GTC'
+  orderType: 'FOK' | 'FAK' | 'GTC',
+  limitPrice?: number,
+  market?: string,
+  tokenSide?: 'UP' | 'DOWN'
 ): Promise<TradeResult> {
   const client = getClobClient();
 
   try {
     log.debug(
-      { tokenId: tokenId.substring(0, 16) + '...', side, amount, orderType },
+      { tokenId: tokenId.substring(0, 16) + '...', side, amount, orderType, limitPrice },
       'Executing CLOB order'
     );
 
     // Fee rate in basis points - 0 for hourly markets (free trading)
     const feeRateBps = 0;
 
-    // Execute market order via CLOB
-    const result = await client.createAndPostMarketOrder(
-      {
-        tokenID: tokenId,
-        amount: amount, // Amount in USDC
-        side: side === 'BUY' ? Side.BUY : Side.SELL,
-        feeRateBps,
-      },
-      { negRisk: false, tickSize: '0.01' },
-      orderType === 'FOK' ? OrderType.FOK : orderType === 'FAK' ? OrderType.FAK : OrderType.GTC
-    );
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let result: any;
+
+    // Check for pre-signed order first (saves ~200-400ms)
+    if (market && tokenSide && limitPrice) {
+      const presigned = getPresignedOrder(market, tokenSide, side, limitPrice, amount);
+      if (presigned) {
+        log.info({ market, tokenSide, limitPrice }, '⚡ Using pre-signed order');
+        result = await postPresignedOrder(
+          presigned,
+          orderType === 'FOK' ? OrderType.FOK : orderType === 'FAK' ? OrderType.FAK : OrderType.GTC
+        );
+      }
+    }
+
+    // If no pre-signed order, create and post with limit price
+    if (!result) {
+      if (limitPrice) {
+        // Use limit order with price protection
+        result = await client.createAndPostOrder(
+          {
+            tokenID: tokenId,
+            price: limitPrice,
+            size: amount,
+            side: side === 'BUY' ? Side.BUY : Side.SELL,
+            feeRateBps,
+          },
+          { negRisk: false, tickSize: '0.01' },
+          orderType === 'FOK' ? OrderType.FOK : orderType === 'FAK' ? OrderType.FAK : OrderType.GTC
+        );
+      } else {
+        // Fallback to market order
+        result = await client.createAndPostMarketOrder(
+          {
+            tokenID: tokenId,
+            amount: amount,
+            side: side === 'BUY' ? Side.BUY : Side.SELL,
+            feeRateBps,
+          },
+          { negRisk: false, tickSize: '0.01' },
+          orderType === 'FOK' ? OrderType.FOK : orderType === 'FAK' ? OrderType.FAK : OrderType.GTC
+        );
+      }
+    }
 
     // Check for errors - both errorMsg and HTTP error status codes
     const httpStatus = (result as { status?: number }).status;

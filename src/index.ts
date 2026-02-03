@@ -21,7 +21,7 @@ import {
 import { startWalletMonitor, stopWalletMonitor, setOnDepositCallback } from './wallet-monitor.js';
 import { startResolutionTracker, stopResolutionTracker } from './resolution-tracker.js';
 import { getPositionsLast15Min, getTodayPositions, getStatsByMarket } from './db.js';
-import { initExecutor, executeDipTrade, isReady as isExecutorReady } from './executor.js';
+import { initExecutor, executeDipTrade, isReady as isExecutorReady, stopPresigner } from './executor.js';
 import {
   initPositionManager,
   canOpenPosition,
@@ -109,14 +109,14 @@ async function main(): Promise<void> {
 
     isRunning = true;
 
-    // Send startup notification
-    await notifyStartup();
+    // Send startup notification (non-blocking to not delay startup)
+    notifyStartup().catch(err => log.error({ err }, 'Failed to send startup notification'));
 
     // Schedule daily stats
     statsInterval = setInterval(
       async () => {
         const stats = getStats();
-        await notifyDailyStats(stats);
+        notifyDailyStats(stats).catch(err => log.error({ err }, 'Failed to send daily stats'));
       },
       24 * 60 * 60 * 1000 // Every 24 hours
     );
@@ -173,7 +173,7 @@ async function main(): Promise<void> {
         wsUpdates: wsCounts.updates,
       };
 
-      await notify15MinSummary(prices, sessionStats, config.paperTrading);
+      notify15MinSummary(prices, sessionStats, config.paperTrading).catch(err => log.error({ err }, 'Failed to send 15min summary'));
 
       // Reset counters for next period
       tradesThisPeriod = 0;
@@ -201,7 +201,7 @@ async function main(): Promise<void> {
       const totalVolume = todayPositions.reduce((sum, p) => sum + p.totalCost, 0);
       const netProfit = resolvedToday.reduce((sum, p) => sum + (p.actualProfit ?? 0) - (p.fees ?? 0), 0);
 
-      await notifyDailySummary({
+      notifyDailySummary({
         totalTrades: todayPositions.length,
         resolvedTrades: resolvedToday.length,
         totalVolume,
@@ -212,7 +212,7 @@ async function main(): Promise<void> {
           trades: m.totalTrades,
           profit: m.netProfit,
         })),
-      });
+      }).catch(err => log.error({ err }, 'Failed to send daily summary'));
     }, 24 * 60 * 60 * 1000); // Every 24 hours
 
     // Handle graceful shutdown
@@ -271,8 +271,8 @@ async function handleOrderbookUpdate(orderbook: Orderbook): Promise<void> {
 
     const opportunity = detection.opportunity!;
 
-    // ALWAYS notify dip detection (even if we can't trade it)
-    await notifyDipDetected(opportunity);
+    // ALWAYS notify dip detection (non-blocking - don't delay trade execution!)
+    notifyDipDetected(opportunity).catch(err => log.error({ err }, 'Failed to send dip notification'));
 
     // Calculate position size with deep liquidity analysis
     const sizing = calculatePositionSizeWithLiquidity(opportunity, orderbook);
@@ -284,8 +284,8 @@ async function handleOrderbookUpdate(orderbook: Orderbook): Promise<void> {
         reason: sizing.reason,
         slippage: (sizing.estimatedSlippage * 100).toFixed(2) + '%',
       }, 'Trade not viable due to liquidity constraints');
-      // Notify that we detected but couldn't trade
-      await notifyTradeFailed(opportunity.market, sizing.reason ?? 'Liquidity constraints');
+      // Notify that we detected but couldn't trade (non-blocking)
+      notifyTradeFailed(opportunity.market, sizing.reason ?? 'Liquidity constraints').catch(err => log.error({ err }, 'Failed to send trade failed notification'));
       return;
     }
 
@@ -343,8 +343,8 @@ async function handleOrderbookUpdate(orderbook: Orderbook): Promise<void> {
         expectedProfit: position.expectedProfit,
       });
 
-      // Notify success
-      await notifyTradeExecuted(position);
+      // Notify success (non-blocking)
+      notifyTradeExecuted(position).catch(err => log.error({ err }, 'Failed to send trade executed notification'));
     } else {
       // 🔓 Clear pending state on failure
       clearTradePending(opportunity.market);
@@ -355,12 +355,12 @@ async function handleOrderbookUpdate(orderbook: Orderbook): Promise<void> {
         error: result.error,
       });
 
-      // Notify failure
-      await notifyTradeFailed(opportunity.market, result.error ?? 'Unknown error');
+      // Notify failure (non-blocking)
+      notifyTradeFailed(opportunity.market, result.error ?? 'Unknown error').catch(err => log.error({ err }, 'Failed to send trade failed notification'));
     }
   } catch (error) {
     log.error({ error, market: orderbook.market }, 'Error handling orderbook update');
-    await notifyError(`orderbook_${orderbook.market}`, error);
+    notifyError(`orderbook_${orderbook.market}`, error).catch(err => log.error({ err }, 'Failed to send error notification'));
   }
 }
 
@@ -385,6 +385,9 @@ async function shutdown(signal: string): Promise<void> {
   // Stop resolution tracker
   stopResolutionTracker();
 
+  // Stop order pre-signer
+  stopPresigner();
+
   // Stop wallet monitor
   stopWalletMonitor();
 
@@ -399,14 +402,15 @@ async function shutdown(signal: string): Promise<void> {
   const openPositions = getAllOpenPositions();
   if (openPositions.length > 0) {
     log.warn({ count: openPositions.length }, 'Shutting down with open positions!');
+    // Non-blocking but we wait a bit for this important notification
     await notifyError(
       'shutdown',
       `Shutting down with ${openPositions.length} open positions. They will resolve automatically.`
-    );
+    ).catch(err => log.error({ err }, 'Failed to send shutdown error'));
   }
 
-  // Send shutdown notification with stats
-  await notifyShutdown(`${signal} - Net profit: $${stats.netProfit.toFixed(2)}`);
+  // Send shutdown notification with stats (await this one as it's the last thing before exit)
+  await notifyShutdown(`${signal} - Net profit: $${stats.netProfit.toFixed(2)}`).catch(err => log.error({ err }, 'Failed to send shutdown notification'));
 
   // Close database
   closeDb();

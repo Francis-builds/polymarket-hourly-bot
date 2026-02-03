@@ -301,22 +301,24 @@ export function detectDip(orderbook: Orderbook): DetectionResult {
     `🎯 DIP DETECTED${windowStr} - EXECUTING TRADE!`
   );
 
-  // Save snapshot for analysis
-  try {
-    saveOrderbookSnapshot({
-      timestamp,
-      market,
-      bestAskUp: bestAskUp.price,
-      bestAskDown: bestAskDown.price,
-      totalCost,
-      liquidityUp5pct: availableLiqUp,
-      liquidityDown5pct: availableLiqDown,
-      depthUp: UP.asks.slice(0, 5),
-      depthDown: DOWN.asks.slice(0, 5),
-    });
-  } catch (err) {
-    log.warn({ err, market }, 'Failed to save snapshot');
-  }
+  // Save snapshot for analysis (deferred to not block trade execution)
+  setImmediate(() => {
+    try {
+      saveOrderbookSnapshot({
+        timestamp,
+        market,
+        bestAskUp: bestAskUp.price,
+        bestAskDown: bestAskDown.price,
+        totalCost,
+        liquidityUp5pct: availableLiqUp,
+        liquidityDown5pct: availableLiqDown,
+        depthUp: UP.asks.slice(0, 5),
+        depthDown: DOWN.asks.slice(0, 5),
+      });
+    } catch (err) {
+      log.warn({ err, market }, 'Failed to save snapshot');
+    }
+  });
 
   return {
     shouldTrade: true,
