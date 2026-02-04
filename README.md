@@ -109,9 +109,6 @@ src/
 ## Deployment (AWS)
 
 ```bash
-# SSH al servidor
-ssh -i ~/.ssh/polymarket-bot-key.pem ubuntu@54.229.162.200
-
 # Ir al directorio
 cd ~/polymarket-hourly-bot
 
